@@ -13,7 +13,7 @@ One Python file, no dependencies for the basics.
 - **A classic download-manager window:** menu bar (Tasks, File, Downloads, View, Help, Registration), an icon toolbar, a navigation tree (All Downloads with its categories, Unfinished, Finished, Grabber projects, Queues) and a sortable list with File Name, Q, Size, Status, Time left, Transfer rate, Last Try and Description columns.
 - **Queues and a site grabber:** keep downloads in named queues you can start and stop together, and scan any web page for the images, videos, documents or archives it links to.
 - **Live speed graph:** a 60-second speed chart (all downloads, or just the one you select) with Now / Peak / Avg, plus a segment map showing which parts of the file each connection has filled.
-- **Video downloads:** HLS (`.m3u8`) streams with quality selection, AES-128 decryption, and optional ffmpeg muxing to `.mp4`.
+- **Video downloads:** HLS (`.m3u8`) streams with quality selection, AES-128 decryption and ffmpeg muxing to `.mp4`; DASH (`.mpd`) manifests through ffmpeg; and YouTube, Facebook, Instagram, Vimeo, TikTok and similar sites through yt-dlp.
 - **Browser integration:** a Chrome/Edge/Brave/Firefox extension that takes over downloads, adds a right-click menu, and adds an IDM-style **Download this video** button with a quality picker on playing videos.
 - **GUI and CLI.**
 
@@ -129,7 +129,8 @@ Downloads you click are handed to OpenDM (if OpenDM isn't running, the browser k
 
 - HLS **live streams** and **DRM-protected** streams (Widevine, FairPlay, SAMPLE-AES) are not supported, and OpenDM does not attempt to circumvent DRM.
 - Video+audio merging needs ffmpeg, and pairing relies on both tracks having been loaded by the page (play the video for a few seconds first).
-- **DASH** (`.mpd`) and site-specific extractors (YouTube etc.) are not included.
+- **DASH** (`.mpd`) is handled by ffmpeg, so it needs an ffmpeg build that can read DASH. The ffmpeg bundled with the Windows installer can; some minimal builds can't, and OpenDM then shows an error instead of a file. DRM-protected DASH is refused.
+- **Video sites** (YouTube etc.) rely on yt-dlp, which the release builds include. Sites change often, so if one stops working, update it with `pip install -U yt-dlp` when running from source.
 - Automatic browser setup was built and tested with the Windows registry API replaced by a faithful stand-in, and for real on Linux (files, launcher, protocol); it hasn't been run against real Chrome or Edge on Windows yet, so please use the checks above and report anything odd. Each download sent through the host starts a short-lived process (about a second with the one-file `.exe`).
 - The scheduler works only while OpenDM is running.
 - The tray icon isn't available on macOS, and on GNOME it needs the AppIndicator extension.
@@ -147,7 +148,7 @@ pip install -r requirements-build.txt && python build.py   # standalone app for 
 
 CI runs the tests on Windows, macOS and Linux. Pushing a tag like `v1.2.0` builds all three apps and attaches them, plus the extension zip, to a GitHub Release.
 
-Ideas for contributions: DASH support, a proper packaged extension for the Chrome/Firefox stores, clipboard monitoring, per-site login profiles, torrent/magnet hand-off, translations.
+Ideas for contributions: a proper packaged extension for the Chrome/Firefox stores, clipboard monitoring, per-site login profiles, torrent/magnet hand-off, translations.
 
 ## License
 
