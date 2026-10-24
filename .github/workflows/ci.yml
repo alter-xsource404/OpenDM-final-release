@@ -1,0 +1,73 @@
+name: CI
+on:
+  push: { branches: [main], tags: ["v*"] }
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+
+  extension-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: cd tests/js && npm install && npm test
+
+  gui-smoke:  # drives the real window under a virtual display; timing-based, so informational only
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get update && sudo apt-get install -y xvfb
+      - run: pip install -r requirements.txt
+      - run: xvfb-run -a python tests/gui_smoke.py
+
+  build:
+    needs: [test, extension-tests]
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements-build.txt
+      - run: python build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opendm-${{ matrix.os }}
+          path: dist/OpenDM-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - name: Zip the browser extension (Chrome/Edge/Brave build)
+        run: cd extension && rm -f manifest.firefox.json && zip -r ../OpenDM-extension.zip .
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*
+            OpenDM-extension.zip
