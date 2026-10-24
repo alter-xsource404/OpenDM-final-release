@@ -3006,7 +3006,7 @@ class NativeIntegration:
         text = json.dumps(data, indent=2) + "\n"
         if read_text(path) != text:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8", newline="") as f:  # newline="": Windows must not turn \n into \r\n, or status() sees it as outdated
                 f.write(text)
 
     def register(self, only=None):

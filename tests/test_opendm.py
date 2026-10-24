@@ -894,6 +894,7 @@ class TestNativeFiles(Base):
                            env={**os.environ, "OPENDM_HOME": self.state})
         self.assertEqual((p.returncode, p.stdout), (2, b""))
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the subprocess registers for the real OS; this test looks in the Linux folder (macOS uses ~/Library)")
     def test_command_line_switches(self):
         env = {**os.environ, "HOME": self.home, "OPENDM_HOME": self.state}
         run = lambda *a: subprocess.run([sys.executable, os.path.join(os.path.dirname(opendm.__file__), "opendm.py"), *a], capture_output=True, text=True, env=env, timeout=30)
@@ -1601,9 +1602,11 @@ class TestUniversal(Base):
         src = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, src, True)
         r = subprocess.run([ff, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=2:s=64x64:r=10", "-f", "lavfi", "-i", "sine=d=2",
-                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "dash", "-seg_duration", "1", os.path.join(src, "out.mpd")], capture_output=True)
-        if r.returncode != 0:
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "dash", "-seg_duration", "1", "out.mpd"], capture_output=True, cwd=src)  # relative name: ffmpeg's DASH muxer mishandles drive-letter paths on Windows
+        if r.returncode != 0 or "out.mpd" not in os.listdir(src):
             self.skipTest("this ffmpeg can't produce DASH test media")
+        if subprocess.run([ff, "-v", "error", "-i", "out.mpd", "-f", "null", "-"], capture_output=True, cwd=src).returncode != 0:
+            self.skipTest("this ffmpeg build can't read DASH (the app reports that to the user instead)")
         for n in os.listdir(src):
             with open(os.path.join(src, n), "rb") as f:
                 UniHandler.FILES["/dash/" + n] = (f.read(), "application/dash+xml" if n.endswith(".mpd") else "video/iso.segment")
