@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "OpenDM Integration",
+  "version": "1.5.0",
+  "description": "Send downloads from your browser to OpenDM, the open-source download manager.",
+  "permissions": [
+    "downloads",
+    "contextMenus",
+    "cookies",
+    "storage",
+    "webRequest",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "OpenDM",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAswSWKl4x6CMaDvDob5dKXW/OKMssU9kwky2Ii8aG3xm5m56oO10O663wKz4wp/6GuMVGOLUu5SDxTRYwbvH6TFYCUjLlET3MW9vxu2gyhXwHH0VYSjdis/vXUQlmpM0+DeUzhe1yKC1jRrHLyTlbCeGzJJ+Bb3rhJID9oayM3osi3lEjnApWj7wHPWt1zJDX1N53X99fahPeMAjVeVSXAf213nmhYrmtBARcDsZ/T7f8XIg0kZY6H5pr1CkI8561YdG1xBOmsD4dkLl63vt5ONDvoxnPcEzxfhfPGvSGdtM8f0YX/123OyRc995ikAVjq4Jbu6C1DI1QQUjjniM02wIDAQAB"
+}

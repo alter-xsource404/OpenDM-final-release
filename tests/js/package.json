@@ -1,0 +1,6 @@
+{
+  "name": "opendm-extension-tests",
+  "private": true,
+  "scripts": { "test": "node background.test.js && node probe.test.js && node native.test.js" },
+  "devDependencies": { "jsdom": "^30.0.0" }
+}

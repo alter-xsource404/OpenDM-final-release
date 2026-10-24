@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8">
+<!-- FIX (#3/#4): IDM-style minimal popup. Floating panel, per-site toggle, compact toggle and "open panel" button removed. -->
+<style>
+ body{font:13px system-ui;width:250px;padding:12px;margin:0} label{display:block;margin:6px 0;cursor:pointer}
+ .n{opacity:.75;margin-top:8px} a{font-size:12px}
+</style>
+<label><input id="on" type="checkbox"> Capture browser downloads</label>
+<label><input id="ovr" type="checkbox"> Show “Download this video” button</label>
+<div class="n" id="conn"></div>
+<p><a href="#" id="opt">Settings / pairing</a></p>
+<script src="popup.js"></script>

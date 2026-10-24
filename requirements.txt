@@ -1,0 +1,6 @@
+# All optional: OpenDM runs on the standard library alone.
+cryptography>=42                       # AES-encrypted HLS streams
+pystray>=0.19; sys_platform != "darwin"  # system tray icon (Windows, Linux)
+pillow>=10                             # needed by pystray, and by tools/make_icons.py
+yt-dlp>=2024.8.6                        # YouTube, Facebook, Instagram, Vimeo, TikTok ... (finds the real stream links)
+imageio-ffmpeg>=0.5                     # a bundled ffmpeg for merging video + audio / HLS / DASH (or put ffmpeg next to opendm.py, or set OPENDM_FFMPEG)
