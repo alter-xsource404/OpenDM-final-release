@@ -1237,8 +1237,24 @@ class TestIdmWindows(Base):
             app.drain_captured()
         cd.assert_called_once_with(job)
         app.mgr.settings["confirm_captured"] = False
+        app.recent_captures.clear(); app.pending_urls.clear()
         app._capture(job)
         self.assertEqual(len(app.mgr.items), 1)  # the switch for the old behaviour
+
+    def test_captured_stale_duplicate_and_one_window_at_a_time(self):
+        app = self.fake_app()
+        mk = lambda n: {"url": f"https://x.test/{n}.zip", "folder": self.tmp, "connections": 4, "kind": None, "kw": {"hint": None}}
+        a, b = mk("a"), mk("b")
+        app._capture(a); app._capture(dict(a)); app._capture(b)   # duplicate of a is dropped
+        self.assertEqual(app.captured.qsize(), 2)
+        with mock.patch.object(app, "confirm_dialog", side_effect=lambda j: app.pending_urls.add(j["url"])) as cd:
+            app.drain_captured(); app.drain_captured()
+        cd.assert_called_once_with(a)                             # b waits until a's window is closed
+        app.pending_urls.clear()
+        app.captured.queue[0]["_t"] -= opendm.CAPTURE_EXPIRE_SECS + 5   # b waited too long: dropped
+        with mock.patch.object(app, "confirm_dialog") as cd2:
+            app.drain_captured()
+        cd2.assert_not_called()
 
     def test_confirm_start_adds_download_and_opens_progress(self):
         app = self.fake_app()

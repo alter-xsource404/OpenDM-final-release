@@ -20,7 +20,7 @@ const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeo
 const nativeCall = (msg) => withTimeout(Promise.resolve(api.runtime.sendNativeMessage(NATIVE_HOST, msg)), 30000);  // 30 s: OpenDM may need time to start
 
 async function sendToOpenDM(job) {
-  const full = { ...job, cookie: await cookieHeader(job.url), userAgent: navigator.userAgent };
+  const full = { ...job, ts: Date.now(), cookie: await cookieHeader(job.url), userAgent: navigator.userAgent };
   let reply = null, nativeError = "";
   try { reply = await nativeCall({ cmd: "add", job: full }); } catch (e) { nativeError = e?.message || String(e); }  // host not registered / not allowed
   if (reply) {
@@ -51,12 +51,42 @@ async function connectionStatus() {
   return { mode: "none", error: nativeError || "OpenDM's browser integration isn't registered yet" };
 }
 
-// Take over browser downloads. If OpenDM isn't running, the browser keeps the download.
+// Take over browser downloads - but ONLY ones the user is starting right now.
+// FIX (phantom downloads): the old code grabbed every download the browser reported (old/resumed items, page-script downloads,
+// downloads from a window the user isn't using). Now a download must be fresh, in the focused window, follow a real user
+// gesture (or a typed address), not be a duplicate, and not be part of a burst. Anything else is left to the browser, untouched.
+const GESTURE_MS = 20e3, FRESH_MS = 15e3, DEDUPE_MS = 60e3, BURST_N = 3, BURST_MS = 10e3;
+let lastGesture = 0;
+const recentUrls = new Map();   // url -> time OpenDM was last offered it
+const burstTimes = [];
+
+async function windowFocused() {
+  try { const w = await api.windows?.getLastFocused?.(); return !w || w.focused !== false; } catch { return true; }
+}
+
+async function shouldCapture(item, url) {
+  const now = Date.now();
+  if (item.byExtensionId) return false;                                   // started by another extension
+  if (item.state && item.state !== "in_progress") return false;           // finished / interrupted old item
+  const started = Date.parse(item.startTime || "");
+  if (started && now - started > FRESH_MS) return false;                 // restored or old item, not a new click
+  for (const [u, t] of recentUrls) if (now - t > DEDUPE_MS) recentUrls.delete(u);
+  if (recentUrls.has(url)) return false;                                  // already offered a moment ago
+  if (!(await windowFocused())) return false;                             // user is not in the browser
+  const typed = !item.referrer;                                           // address bar / bookmark: no page involved
+  if (!typed && now - lastGesture > GESTURE_MS) return false;             // page script started it without the user
+  while (burstTimes.length && now - burstTimes[0] > BURST_MS) burstTimes.shift();
+  if (burstTimes.length >= BURST_N) return false;                         // a page spraying downloads
+  burstTimes.push(now); recentUrls.set(url, now);
+  return true;
+}
+
 api.downloads.onCreated.addListener(async (item) => {
   const cfg = await getCfg();
   const url = item.finalUrl || item.url;
   if (!cfg.intercept || !/^https?:/i.test(url)) return;
   if (cfg.minSizeKB && item.fileSize > 0 && item.fileSize < cfg.minSizeKB * 1024) return;
+  if (!(await shouldCapture(item, url))) return;                          // not the user's download: leave it to the browser
   try { await api.downloads.pause(item.id); } catch {}  // keep the browser's copy from finishing while OpenDM (maybe starting up) takes over
   try {
     const name = item.filename ? item.filename.split(/[\\/]/).pop() : "";
@@ -322,6 +352,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab?.id;
   const reply = (p) => { p.then(sendResponse, (e) => sendResponse({ ok: false, error: e.message })); return true; };
   switch (msg?.cmd) {
+    case "gesture": lastGesture = Date.now(); return false;   // real click/key in a page (content.js)
     case "send": return reply(sendToOpenDM(msg.job).then(() => ({ ok: true })));
     case "status": return reply(connectionStatus().then((s) => ({ ok: true, ...s })));
     case "formats":  // the overlay's menu; only for web addresses

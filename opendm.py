@@ -2725,6 +2725,12 @@ def get_token(state_dir=None):
         return t
 
 
+STALE_CAPTURE_SECS = 90      # a browser request older than this is ignored
+CAPTURE_DEDUPE_SECS = 30     # the same link offered again within this time is ignored
+CAPTURE_EXPIRE_SECS = 300    # a confirmation that waited this long unanswered is dropped
+CAPTURE_MAX_QUEUE = 10
+
+
 def start_api(mgr, defaults, port=API_PORT, token=None, state_dir=None, confirm=None):
     """Local-only API for the browser extension. Needs the pairing token AND an
     extension Origin (web pages cannot forge Origin) AND a localhost Host header
@@ -2819,6 +2825,9 @@ def start_api(mgr, defaults, port=API_PORT, token=None, state_dir=None, confirm=
             d, url = self._body()
             if d is None:
                 return
+            ts = d.get("ts")  # when the browser says the user started it (ms); old requests are never shown
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool) and abs(time.time() - ts / 1000.0) > STALE_CAPTURE_SECS:
+                return self._send(409, {"error": "stale request ignored"})
             folder, conns = defaults()
             kind_in = d.get("kind")
             hls, yt, dash = kind_in == "hls", kind_in == "ytdlp", kind_in == "dash"
@@ -2870,7 +2879,7 @@ def write_api_hint(port, state_dir=None):
 NATIVE_HOST_NAME = "org.opendm.nativehost"
 DEFAULT_EXTENSION_IDS = ("jngcdhpgdacflokoombdcimnonfngiff",)  # fixed by the "key" in extension/manifest.json (tools/extension_id.py)
 FIREFOX_EXTENSION_ID = "opendm@alter-xsource404.github.io"                    # the gecko id in extension/manifest.firefox.json
-HOST_JOB_KEYS = ("url", "referer", "filename", "kind", "quality", "bandwidth", "audioUrl", "cookie", "userAgent")
+HOST_JOB_KEYS = ("url", "referer", "filename", "kind", "quality", "bandwidth", "audioUrl", "cookie", "userAgent", "ts")
 MAX_NATIVE_MESSAGE = 1 << 20
 
 # key, label, Windows registry path under HKCU, Linux folder, macOS folder, manifest flavour
@@ -4070,19 +4079,31 @@ class App:
 
     def _capture(self, job):
         """Called from the API thread for every link the browser sends."""
+        now = time.time()
+        seen = self.__dict__.setdefault("recent_captures", {})   # url -> time it was last offered
+        for u in [u for u, t in seen.items() if now - t > CAPTURE_DEDUPE_SECS]:
+            seen.pop(u, None)
+        if job["url"] in seen or job["url"] in self.pending_urls:  # the browser sometimes sends a link twice
+            return
+        seen[job["url"]] = now
         if self.mgr.settings.get("confirm_captured", True):
+            if self.captured.qsize() >= CAPTURE_MAX_QUEUE:  # a page spraying links: don't bury the user in windows
+                return
+            job["_t"] = now
             self.captured.put(job)  # the GUI thread shows the confirmation window
         else:
             self.mgr.add(job["url"], job["folder"], job["connections"], kind=job["kind"], **job["kw"])
 
     def drain_captured(self):
-        while True:
+        # One confirmation window at a time; the rest wait in the queue (and expire if the user never gets to them).
+        while not self.pending_urls:
             try:
                 job = self.captured.get_nowait()
             except queue.Empty:
                 return
-            if job["url"] not in self.pending_urls:  # the browser sometimes sends a link twice
-                self.confirm_dialog(job)
+            if time.time() - job.get("_t", time.time()) > CAPTURE_EXPIRE_SECS:
+                continue
+            self.confirm_dialog(job)
 
     def confirm_dialog(self, job):
         """'Download File Info': a captured link only starts when the user clicks Start Download."""

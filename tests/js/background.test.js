@@ -1,16 +1,18 @@
 // Runs the real extension/background.js against stubbed browser APIs
 const assert = require("assert");
+let resumed = 0;
 const mem = {}, listeners = {}, badge = {}, sent = [];
 const store = () => ({ get: async (k) => (typeof k === "string" ? { [k]: mem[k] } : Object.fromEntries(Object.entries(k).map(([a, d]) => [a, mem[a] ?? d]))),
                        set: async (o) => Object.assign(mem, o), remove: async (k) => { delete mem[k]; } });
 const ev = (n) => ({ addListener: (f) => (listeners[n] = f) });
 globalThis.chrome = {
   storage: { local: store(), session: store(), onChanged: ev("sc") },
-  webRequest: { onHeadersReceived: ev("hdr") }, downloads: { onCreated: ev("dl"), cancel: async () => {}, erase: async () => {} },
+  webRequest: { onHeadersReceived: ev("hdr") }, downloads: { onCreated: ev("dl"), cancel: async () => {}, erase: async () => {}, pause: async () => {}, resume: async () => { resumed++; } },
   cookies: { getAll: async () => [{ name: "sid", value: "abc" }] },
   action: { setBadgeText: (o) => (badge[o.tabId] = o.text), setBadgeBackgroundColor() {} },
   tabs: { get: async () => ({ url: "https://site.test/watch", title: "My Clip" }), onUpdated: ev("upd"), onRemoved: ev("rem"),
           sendMessage: async (id, m) => { sent.push([id, m.cmd]); } },
+  windows: { getLastFocused: async () => ({ focused: globalThis.__focused !== false }) },
   runtime: { onMessage: ev("msg"), onInstalled: ev("inst"), getURL: (p) => p },
   contextMenus: { create() {}, onClicked: ev("ctx") },
 };
@@ -71,6 +73,22 @@ const msg = (m, tab = 7) => new Promise((res) => { const r = listeners.msg(m, { 
   assert(r.ok); assert.strictEqual(post[1].headers["X-OpenDM-Token"], "TKN");
   assert.deepStrictEqual([body.kind, body.quality, body.bandwidth, body.cookie], ["hls", 720, 2800000, "sid=abc"]);
   console.log("PASS send: POST /add with token, quality=720, bandwidth=2800000, cookie, kind=hls");
+  // phantom-download guard: only fresh downloads that follow a real user gesture are taken over
+  const posts = () => calls.filter(([u]) => u === "http://127.0.0.1:6800/add").length;
+  const dl = (o) => listeners.dl({ id: 1, state: "in_progress", startTime: new Date().toISOString(), referrer: "https://site.test/p", ...o });
+  const wait = () => new Promise((r) => setTimeout(r, 50));
+  let n = posts(); await dl({ url: "https://cdn.test/a.png" }); await wait();
+  assert.strictEqual(posts(), n); console.log("PASS no user gesture -> page-started download left to the browser");
+  await msg({ cmd: "gesture" }); await dl({ url: "https://cdn.test/old.msi", startTime: new Date(Date.now() - 60000).toISOString() }); await wait();
+  assert.strictEqual(posts(), n); console.log("PASS old/restored download ignored");
+  globalThis.__focused = false; await dl({ url: "https://cdn.test/bg.zip" }); await wait(); globalThis.__focused = true;
+  assert.strictEqual(posts(), n); console.log("PASS unfocused browser window ignored");
+  await dl({ url: "https://cdn.test/real.zip" }); await wait();
+  assert.strictEqual(posts(), n + 1); console.log("PASS fresh download after a gesture is sent");
+  await dl({ url: "https://cdn.test/real.zip" }); await wait();
+  assert.strictEqual(posts(), n + 1); console.log("PASS duplicate ignored");
+  for (const x of ["b", "c", "d", "e"]) await dl({ url: "https://cdn.test/" + x + ".zip" });
+  await wait(); assert.strictEqual(posts(), n + 3); console.log("PASS burst of downloads capped at 3");
   delete mem.token; const bad = await msg({ cmd: "send", job: { url: "https://x.test/a.zip" } });
   assert(!bad.ok && /not paired/.test(bad.error)); console.log("PASS send without pairing -> clear error:", bad.error);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });
