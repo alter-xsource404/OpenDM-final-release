@@ -59,10 +59,11 @@ const JOB = { url: "https://cdn.test/a.zip", referer: "https://site.test/", file
 
     // 6. taking over a browser download: pause it, hand it over, then remove it; if OpenDM can't take it, let the browser continue
     reset(); hostBehaviour = () => ({ ok: true });
+    await msg({ cmd: "gesture" });   // a real click precedes a real download
     await L.dl({ id: 7, url: "https://cdn.test/big.iso", referrer: "https://site.test/", filename: "C:\\Users\\me\\Downloads\\big.iso", fileSize: 9e6 });
     assert.deepStrictEqual(dl.map((x) => x[0]), ["pause", "cancel", "erase"]); assert.strictEqual(native[0][1].job.filename, "big.iso");
     reset(); hostBehaviour = () => ({ ok: false, error: "nope" });
-    await L.dl({ id: 8, url: "https://cdn.test/big.iso", filename: "big.iso" });
+    await L.dl({ id: 8, url: "https://cdn.test/big2.iso", filename: "big.iso" });
     assert.deepStrictEqual(dl.map((x) => x[0]), ["pause", "resume"]);
     console.log("PASS browser download: paused -> handed to OpenDM -> cancelled/erased; on failure it is resumed so nothing is lost");
     reset(); mem.intercept = false; await L.dl({ id: 9, url: "https://cdn.test/x.zip" }); assert.strictEqual(native.length + dl.length, 0); mem.intercept = true;
