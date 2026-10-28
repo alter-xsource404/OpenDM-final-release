@@ -4,7 +4,8 @@ OpenDM - a free, open-source download manager (MIT License)
 
 Features: multi-connection segmented downloads with dynamic splitting, pause/resume
 (even after restart), queue, speed limiter, scheduler, HLS (.m3u8) video downloads,
-browser extension integration, categories with auto-sorting, system tray, GUI (tkinter) and CLI.
+browser extension integration, categories with auto-sorting, system tray, HTTP/HTTPS/FTP, HTTP and SOCKS5
+proxies, site logins, checksum verification, automatic retry, sound alerts, dark mode, GUI (tkinter) and CLI.
 Standard library only (optional: `cryptography` for AES-encrypted HLS, `pystray`+`pillow` for the tray icon,
 `ffmpeg` for mp4 muxing and HLS/DASH merging - found via OPENDM_FFMPEG, next to this file, `imageio-ffmpeg`, or PATH; `yt-dlp` for YouTube/Facebook/Instagram/... pages).
 
@@ -13,12 +14,17 @@ CLI:  python opendm.py URL [URL ...] [-n 8] [-o ~/Downloads]
 """
 import os, sys, json, time, threading, argparse, subprocess, platform, secrets, re, shutil
 import http.server, html.parser, math, copy, queue, io, base64, shlex, struct
-import urllib.error, mimetypes
+import urllib.error, mimetypes, fnmatch, tempfile, random
+import hashlib, socket, ftplib, functools, ipaddress, http.client, email.utils, glob
+try:
+    import ssl
+except ImportError:  # a Python without TLS can still do plain http / ftp
+    ssl = None
 from collections import deque
 import urllib.request, urllib.parse
 from email.message import Message
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 UA = f"Mozilla/5.0 (compatible; OpenDM/{__version__})"
 CHUNK = 64 * 1024
 MAIN_QUEUE = "Main download queue"
@@ -570,6 +576,289 @@ def nice_max(v):
     return max(10 * e * unit, 1024.0)
 
 
+# ============================ checksums ============================
+HASH_ALGOS = ("md5", "sha1", "sha256", "sha512")
+_HASH_LEN = {32: "md5", 40: "sha1", 64: "sha256", 128: "sha512"}
+
+
+def parse_checksum(text):
+    """'sha256:ab12...', 'AB12... *file.iso' (sha256sum style) or a bare hex string -> ('sha256', 'ab12...'); None if it isn't a hash."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.match(r"(?i)^(md5|sha-?1|sha-?256|sha-?512)\s*[:=]\s*([0-9a-f]+)\s*$", t)
+    if m:
+        algo, hexs = m.group(1).lower().replace("-", ""), m.group(2).lower()
+    else:
+        hexs, algo = t.split()[0].lower(), None
+    if not re.fullmatch(r"[0-9a-f]+", hexs):
+        return None
+    algo = algo or _HASH_LEN.get(len(hexs))
+    return (algo, hexs) if algo and _HASH_LEN.get(len(hexs)) == algo else None
+
+
+def normalize_checksum(text):
+    """'' for a blank value, else 'algo:hex'. Raises ValueError if the text isn't an MD5 / SHA-1 / SHA-256 / SHA-512 value."""
+    if not (text or "").strip():
+        return ""
+    cs = parse_checksum(text)
+    if not cs:
+        raise ValueError("not an MD5, SHA-1, SHA-256 or SHA-512 value")
+    return f"{cs[0]}:{cs[1]}"
+
+
+def hash_file_multi(path, algos=HASH_ALGOS, stop=None, progress=None):
+    """Read the file once and return {algo: hexdigest} ({} if `stop` was set). progress(done_bytes, total_bytes) is called as it goes."""
+    hs = {a: hashlib.new(a) for a in algos}
+    total, done = os.path.getsize(path), 0
+    with open(path, "rb") as f:
+        while True:
+            if stop is not None and stop.is_set():
+                return {}
+            buf = f.read(1 << 20)
+            if not buf:
+                break
+            for h in hs.values():
+                h.update(buf)
+            done += len(buf)
+            if progress:
+                progress(done, total)
+    return {a: h.hexdigest() for a, h in hs.items()}
+
+
+def hash_file(path, algo="sha256", stop=None, progress=None):
+    return hash_file_multi(path, (algo,), stop, progress).get(algo)
+
+
+# ============================ appearance: dark mode + accent colours ============================
+DEFAULT_ACCENT = "#2563eb"
+ACCENTS = (("Blue", "#2563eb"), ("Teal", "#0d9488"), ("Green", "#16a34a"), ("Orange", "#ea580c"), ("Red", "#dc2626"),
+           ("Purple", "#7c3aed"), ("Pink", "#db2777"))
+
+
+def valid_hex(c):
+    c = (c or "").strip()
+    return c.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", c) else ""
+
+
+def _rgb(c):
+    return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def mix(a, b, t):
+    """Colour a moved a fraction t of the way towards colour b ('#rrggbb')."""
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(_rgb(a), _rgb(b)))
+
+
+def luminance(c):
+    def lin(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(x) for x in _rgb(c))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_fg(bg):
+    """Black or white, whichever is easier to read on `bg`."""
+    return "#000000" if luminance(bg) > 0.179 else "#ffffff"
+
+
+# Skins: whole colour schemes. name -> (base mode, palette overrides, accent used while the accent is still the default one).
+SKINS = {
+    "midnight": ("dark", dict(bg="#0d1117", panel="#161b22", field="#010409", fg="#c9d1d9", muted="#8b949e", border="#30363d", grid="#21262d", button="#21262d",
+                              button_active="#30363d", graph_bg="#010409", map_bg="#161b22", seg_empty="#21262d", seg_border="#484f58"), "#58a6ff"),
+    "nord": ("dark", dict(bg="#2e3440", panel="#3b4252", field="#252a33", fg="#eceff4", muted="#a3adbf", border="#4c566a", grid="#434c5e", button="#434c5e",
+                          button_active="#4c566a", graph_bg="#252a33", map_bg="#3b4252", seg_empty="#434c5e", seg_border="#6b7690"), "#88c0d0"),
+    "solarized dark": ("dark", dict(bg="#002b36", panel="#073642", field="#00212b", fg="#93a1a1", muted="#657b83", border="#18505c", grid="#0a3d4a", button="#0a3d4a",
+                                    button_active="#14505e", graph_bg="#00212b", map_bg="#073642", seg_empty="#0a3d4a", seg_border="#586e75"), "#268bd2"),
+    "solarized light": ("light", dict(bg="#fdf6e3", panel="#eee8d5", field="#fffdf5", fg="#586e75", muted="#93a1a1", border="#d8d0b8", grid="#eee8d5", button="#eee8d5",
+                                      button_active="#e3dcc2", graph_bg="#fffdf5", map_bg="#f5eed8", seg_empty="#eee8d5", seg_border="#93a1a1"), "#268bd2"),
+    "forest": ("light", dict(bg="#eef3ec", panel="#dde7d9", field="#fbfdfa", fg="#1f2d22", muted="#5f7466", border="#b9c9b2", grid="#dde7d9", button="#dde7d9",
+                             button_active="#cbdbc5", graph_bg="#fbfdfa", map_bg="#e6eee2", seg_empty="#dde7d9", seg_border="#8aa08f"), "#2f7d4f"),
+    "high contrast": ("dark", dict(bg="#000000", panel="#0a0a0a", field="#000000", fg="#ffffff", muted="#d0d0d0", border="#ffffff", grid="#555555", button="#1a1a1a",
+                                   button_active="#333333", graph_bg="#000000", map_bg="#0a0a0a", seg_empty="#333333", seg_border="#ffffff"), "#ffd400"),
+}
+
+
+def skin_names():
+    return ["default"] + list(SKINS)
+
+
+def make_palette(mode="light", accent=DEFAULT_ACCENT, skin="default"):
+    """Every colour the window and the graphs use, for 'light' or 'dark' and an accent colour. A skin (see SKINS) replaces the whole scheme:
+    it decides the mode itself, and supplies its own accent unless the user picked one."""
+    accent = valid_hex(accent) or DEFAULT_ACCENT
+    sk = SKINS.get(str(skin).lower())
+    if sk:
+        mode = sk[0]
+        accent = sk[2] if accent == DEFAULT_ACCENT else accent
+    if mode == "dark":
+        p = dict(bg="#1e1f22", panel="#2b2d31", field="#17181a", fg="#e6e6e6", muted="#9aa0a6", border="#3c3f45", grid="#34373c",
+                 button="#3a3d43", button_active="#4a4d54", graph_bg="#17181a", map_bg="#2b2d31", seg_empty="#34373c", seg_border="#5a5e66")
+    else:
+        mode = "light"
+        p = dict(bg="#f0f0f0", panel="#e5e7eb", field="#ffffff", fg="#111827", muted="#6b7280", border="#c7cbd1", grid="#e5e7eb",
+                 button="#e5e7eb", button_active="#d5d8de", graph_bg="white", map_bg="#f3f4f6", seg_empty="#e5e7eb", seg_border="#9ca3af")
+    if sk:
+        p.update(sk[1])
+    soft = mix(accent, p["graph_bg"], 0.65) if mode == "dark" else ("#bfdbfe" if accent == DEFAULT_ACCENT else mix(accent, "#ffffff", 0.75))
+    p.update(mode=mode, accent=accent, accent_fg=contrast_fg(accent), accent_soft=soft)
+    return p
+
+
+PAL = make_palette("light")  # the colours draw_graph / draw_segmap read; the window replaces them with set_palette()
+
+
+def set_palette(p):
+    PAL.clear()
+    PAL.update(p)
+
+
+def system_is_dark():
+    """Does the operating system currently prefer dark apps? (False when it can't tell.)"""
+    try:
+        s = platform.system()
+        if s == "Windows":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+        if s == "Darwin":
+            r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, text=True, timeout=2)
+            return "dark" in r.stdout.lower()
+        if "dark" in os.environ.get("GTK_THEME", "").lower():
+            return True
+        if shutil.which("gsettings"):
+            for key in ("color-scheme", "gtk-theme"):
+                r = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", key], capture_output=True, text=True, timeout=2)
+                if "dark" in r.stdout.lower():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def resolve_mode(setting):
+    """'light' | 'dark' | 'system' (follow the OS) -> 'light' or 'dark'."""
+    return setting if setting in ("light", "dark") else ("dark" if system_is_dark() else "light")
+
+
+def set_dark_titlebar(win, dark):
+    """Windows 10/11: make the window's title bar match the theme."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        v = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v)) == 0:
+                break
+    except Exception:
+        pass
+
+
+# ============================ sound alerts ============================
+SOUND_EVENTS = (("complete", "A download finishes"), ("all_done", "Everything in the queue is finished"),
+                ("error", "A download fails (or fails its checksum)"))
+SOUND_PRIORITY = ("error", "all_done", "complete")  # when several things happen at once, only the most important one is played
+_WIN_SOUND = {"complete": "SystemAsterisk", "all_done": "SystemExclamation", "error": "SystemHand"}
+_MAC_SOUND = {"complete": "Glass", "all_done": "Hero", "error": "Basso"}
+_LINUX_SOUND = {"complete": ("complete", "bell"), "all_done": ("service-login", "message", "complete"), "error": ("dialog-error", "dialog-warning", "bell")}
+_LINUX_PLAYERS = (("paplay",), ("pw-play",), ("ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"), ("play", "-q"), ("aplay", "-q"))
+
+
+def sound_plan(event, system=None, custom="", which=shutil.which, exists=os.path.isfile):
+    """What to run to make the sound for `event`: ('win', alias_or_wav, is_file) | ('cmd', argv) | None (nothing available)."""
+    system = system or platform.system()
+    f = custom if custom and exists(custom) and (system != "Windows" or custom.lower().endswith(".wav")) else ""
+    if system == "Windows":
+        return ("win", f or _WIN_SOUND.get(event, "SystemAsterisk"), bool(f))
+    if system == "Darwin":
+        f = f or f"/System/Library/Sounds/{_MAC_SOUND.get(event, 'Glass')}.aiff"
+        return ("cmd", ["afplay", f]) if which("afplay") and exists(f) else None
+    if not f:
+        for name in _LINUX_SOUND.get(event, ("complete",)):
+            for ext in (".oga", ".ogg", ".wav"):
+                p = f"/usr/share/sounds/freedesktop/stereo/{name}{ext}"
+                if exists(p):
+                    f = p
+                    break
+            if f:
+                break
+    if not f:
+        return None
+    for argv in _LINUX_PLAYERS:
+        if which(argv[0]) and not (argv[0] == "aplay" and not f.lower().endswith(".wav")):
+            return ("cmd", [*argv, f])
+    return None
+
+
+def run_sound(plan):
+    """Start playing (never waits for the sound to end). True if something was started."""
+    if not plan:
+        return False
+    try:
+        if plan[0] == "win":
+            import winsound
+            winsound.PlaySound(plan[1], (winsound.SND_FILENAME if plan[2] else winsound.SND_ALIAS) | winsound.SND_ASYNC)
+        else:
+            p = subprocess.Popen(plan[1], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_ff_flags())
+            threading.Thread(target=p.wait, daemon=True).start()  # reap it, so no zombie processes pile up
+        return True
+    except Exception:
+        return False
+
+
+def in_hours(start, stop, now_min=None):
+    """Is the clock inside start..stop ('HH:MM', overnight ranges like 22:00-07:00 work)?"""
+    if now_min is None:
+        t = time.localtime()
+        now_min = t.tm_hour * 60 + t.tm_min
+    try:
+        a, b = parse_hm(start), parse_hm(stop)
+    except ValueError:
+        return False
+    if a == b:
+        return False
+    return a <= now_min < b if a < b else (now_min >= a or now_min < b)
+
+
+class SoundPlayer:
+    """Plays at most one sound per burst of events, never while you are looking at the window (if you ask), never in quiet hours."""
+    GAP = 1.5  # seconds between sounds
+
+    def __init__(self, settings, focused=lambda: False, runner=None, clock=time.time):
+        self.st, self.focused, self.clock, self.last, self.fallback = settings, focused, clock, 0.0, None
+        self.runner = runner or (lambda ev, custom: run_sound(sound_plan(ev, custom=custom)))
+
+    def allowed(self, event, now_min=None):
+        st = self.st
+        if not st.get("sound", True) or not st.get("sound_" + event, True):
+            return False
+        if st.get("sound_unfocused_only") and self.focused():
+            return False
+        return not (st.get("sound_quiet") and in_hours(st.get("sound_quiet_from", "22:00"), st.get("sound_quiet_to", "07:00"), now_min))
+
+    def play(self, event, force=False):
+        """Play one sound now. force=True ignores the rules (the Test buttons)."""
+        custom = (self.st.get("sound_files") or {}).get(event, "")
+        ok = self.runner(event, custom)
+        if not ok and self.fallback:
+            self.fallback()
+        return ok
+
+    def flush(self, events):
+        """events: the set of things that happened since the last call. Returns the event that was played (or None)."""
+        now = self.clock()
+        pick = next((e for e in SOUND_PRIORITY if e in events and self.allowed(e)), None)
+        if pick is None or now - self.last < self.GAP:
+            return None
+        self.last = now
+        self.play(pick)
+        return pick
+
+
 def graph_stats(samples, window=60):
     data = list(samples)[-window:]
     return (data[-1] if data else 0.0, max(data, default=0.0), sum(data) / len(data) if data else 0.0)
@@ -583,10 +872,10 @@ def draw_graph(cv, samples, window=60):
     pw, ph = W - L - R, H - T - B
     data = list(samples)[-window:]
     ymax = nice_max(max(data, default=0.0) * 1.15)
-    grey, font = "#6b7280", ("TkDefaultFont", 8)
+    grey, font = PAL["muted"], ("TkDefaultFont", 8)
     for i in range(5):
         y = T + ph * i / 4
-        cv.create_line(L, y, W - R, y, fill="#e5e7eb")
+        cv.create_line(L, y, W - R, y, fill=PAL["grid"])
         cv.create_text(L - 6, y, text=human(ymax * (4 - i) / 4) + "/s", anchor="e", fill=grey, font=font)
     for frac, label, anchor in ((0, f"{window}s ago", "w"), (0.5, f"{window // 2}s", "center"), (1, "now", "e")):
         cv.create_text(L + pw * frac, H - 8, text=label, anchor=anchor, fill=grey, font=font)
@@ -595,11 +884,11 @@ def draw_graph(cv, samples, window=60):
     pts = [(L + pw * (window - len(data) + i) / (window - 1), T + ph * (1 - min(v / ymax, 1.0)))
            for i, v in enumerate(data)]
     poly = [(pts[0][0], T + ph)] + pts + [(pts[-1][0], T + ph)]
-    cv.create_polygon([c for p in poly for c in p], fill="#bfdbfe", outline="")
+    cv.create_polygon([c for p in poly for c in p], fill=PAL["accent_soft"], outline="")
     if len(pts) > 1:
-        cv.create_line([c for p in pts for c in p], fill="#2563eb", width=2)
+        cv.create_line([c for p in pts for c in p], fill=PAL["accent"], width=2)
     x, y = pts[-1]
-    cv.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#2563eb", outline="white")
+    cv.create_oval(x - 3, y - 3, x + 3, y + 3, fill=PAL["accent"], outline=PAL["graph_bg"])
 
 
 def draw_segmap(cv, cells):
@@ -608,12 +897,12 @@ def draw_segmap(cv, cells):
     W, H = max(cv.winfo_width(), 100), max(cv.winfo_height(), 10)
     if not cells:
         cv.create_text(6, H / 2, text="Select a single download to see its segments", anchor="w",
-                       fill="#6b7280", font=("TkDefaultFont", 8))
+                       fill=PAL["muted"], font=("TkDefaultFont", 8))
         return
     for x0, x1, xf in cells:
-        cv.create_rectangle(x0 * W, 1, x1 * W, H - 1, fill="#e5e7eb", outline="#9ca3af")
+        cv.create_rectangle(x0 * W, 1, x1 * W, H - 1, fill=PAL["seg_empty"], outline=PAL["seg_border"])
         if xf > x0:
-            cv.create_rectangle(x0 * W, 1, xf * W, H - 1, fill="#2563eb", outline="")
+            cv.create_rectangle(x0 * W, 1, xf * W, H - 1, fill=PAL["accent"], outline="")
 
 
 
@@ -712,9 +1001,17 @@ def fmt_when(ts):
 
 def status_text(d):
     if d.status == "Completed":
-        return "Complete"
+        if getattr(d, "scan", "") == "infected":
+            return "Complete - THREAT FOUND"
+        if getattr(d, "_verifying", False):
+            return "Complete (checking hash...)"
+        if getattr(d, "_scanning", False):
+            return "Complete (scanning...)"
+        return {"ok": "Complete (hash OK)", "bad": "Complete - HASH MISMATCH", "missing": "Complete (file missing)"}.get(getattr(d, "verified", ""), "Complete")
     if d.status == "Error":
-        return "Error" + (f": {d.error[:40]}" if d.error else "")
+        wait = getattr(d, "retry_at", 0) - time.time() if getattr(d, "retry_at", 0) else None
+        again = "" if wait is None else (f"retry in {int(wait) + 1}s: " if wait > 0 else "waiting for network: ")
+        return "Error" + (f": {again}{d.error[:40]}" if d.error else (f": {again}" if again else ""))
     note = f" ({d.note[:30]})" if getattr(d, "note", "") else ""
     if d.status == "Connecting":
         return "Connecting..."
@@ -853,12 +1150,433 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
-            for k in [k for k in new.headers if k.lower() == "cookie"]:
-                del new.headers[k]
+            for k in [k for k in new.headers if k.lower() in ("cookie", "authorization")]:
+                del new.headers[k]  # a login or cookie is only ever sent to the host it was meant for
         return new
 
 
-OPENER = urllib.request.build_opener(_Redirect())
+# ============================ network: proxies, logins, FTP, retry rules ============================
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+URL_SCHEMES = ("http://", "https://", "ftp://", "ftps://")  # what the Add dialog, the CLI and list import accept (the browser API stays http(s) only)
+RETRY_DELAYS = (15, 30, 60, 120, 300, 600)  # seconds before automatic retry no. 1, 2, 3 ...
+PROXY_KEYS = ("proxy_mode", "proxy_type", "proxy_host", "proxy_port", "proxy_user", "proxy_pass", "proxy_bypass")
+
+
+def _host_of(url):
+    return (urllib.parse.urlsplit(url if "//" in url else "//" + url).hostname or "").lower()
+
+
+def split_login(url):
+    """'ftp://me:pw@host/x' -> ('ftp://host/x', ('me', 'pw')); a link without credentials -> (url, None)."""
+    p = urllib.parse.urlsplit(url)
+    if "@" not in p.netloc:
+        return url, None
+    info, _, host = p.netloc.rpartition("@")
+    user, _, pw = info.partition(":")
+    return urllib.parse.urlunsplit((p.scheme, host, p.path, p.query, p.fragment)), (urllib.parse.unquote(user), urllib.parse.unquote(pw))
+
+
+def parse_bypass(text):
+    return list(LOCAL_HOSTS) + [x for x in re.split(r"[,;\s]+", text or "") if x]
+
+
+def bypass_match(host, patterns):
+    """Should `host` skip the proxy? Patterns: example.com / .example.com / *.example.com (the domain and its sub-domains), 10.0.0.0/8, an address, *."""
+    host = (host or "").lower().strip("[]")
+    for p in patterns:
+        p = p.strip().lower()
+        if not p:
+            continue
+        if p == "*":
+            return True
+        if "/" in p:
+            try:
+                if ipaddress.ip_address(host) in ipaddress.ip_network(p, strict=False):
+                    return True
+            except ValueError:
+                pass
+            continue
+        p = p[1:] if p.startswith("*.") else p
+        p = p[1:] if p.startswith(".") else p
+        if host == p or host.endswith("." + p):
+            return True
+    return False
+
+
+def proxy_port(st):
+    try:
+        port = int(st.get("proxy_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return port or (1080 if st.get("proxy_type") == "socks5" else 8080)
+
+
+def proxy_url(st):
+    """The manual proxy as one URL (http://user:pw@host:port or socks5h://...), '' if no manual proxy is set. Also what yt-dlp is given."""
+    if st.get("proxy_mode") != "manual" or not st.get("proxy_host"):
+        return ""
+    auth = ""
+    if st.get("proxy_user"):
+        auth = urllib.parse.quote(st["proxy_user"], safe="") + (":" + urllib.parse.quote(st.get("proxy_pass") or "", safe="") if st.get("proxy_pass") else "") + "@"
+    host = st["proxy_host"].strip()
+    host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{'socks5h' if st.get('proxy_type') == 'socks5' else 'http'}://{auth}{host}:{proxy_port(st)}"
+
+
+def parse_proxy(text):
+    """'http://user:pw@host:3128' or 'socks5://host:1080' -> the proxy_* settings. Raises ValueError for anything else."""
+    p = urllib.parse.urlsplit(text if "//" in text else "http://" + text)
+    if p.scheme not in ("http", "https", "socks5", "socks5h") or not p.hostname:
+        raise ValueError("a proxy looks like http://host:port or socks5://host:port")
+    return {"proxy_mode": "manual", "proxy_type": "socks5" if p.scheme.startswith("socks") else "http", "proxy_host": p.hostname,
+            "proxy_port": p.port or 0, "proxy_user": urllib.parse.unquote(p.username or ""), "proxy_pass": urllib.parse.unquote(p.password or "")}
+
+
+class SocksError(ConnectionError):
+    pass
+
+
+class SocksAuthError(OSError):
+    pass
+
+
+_SOCKS_REPLY = {1: "general failure", 2: "not allowed by the proxy's rules", 3: "network unreachable", 4: "host unreachable",
+                5: "connection refused", 6: "TTL expired", 7: "command not supported", 8: "address type not supported"}
+
+
+def _recv_n(s, n):
+    buf = b""
+    while len(buf) < n:
+        c = s.recv(n - len(buf))
+        if not c:
+            raise SocksError("the SOCKS proxy closed the connection")
+        buf += c
+    return buf
+
+
+def socks5_connect(proxy, dest, user="", password="", timeout=30):
+    """Open a TCP connection to dest=(host, port) through a SOCKS5 proxy (RFC 1928, user/password login per RFC 1929). Names are resolved by the proxy."""
+    s = socket.create_connection(proxy, timeout=timeout)
+    try:
+        methods = b"\x00\x02" if user else b"\x00"
+        s.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        ver, method = _recv_n(s, 2)
+        if ver != 5:
+            raise SocksError("that is not a SOCKS5 proxy")
+        if method == 2:
+            u, p = user.encode(), (password or "").encode()
+            if len(u) > 255 or len(p) > 255:
+                raise SocksAuthError("the proxy user name or password is too long")
+            s.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+            if _recv_n(s, 2)[1] != 0:
+                raise SocksAuthError("the SOCKS proxy refused the user name or password")
+        elif method == 0xFF:
+            raise SocksAuthError("the SOCKS proxy needs a user name and password")
+        elif method != 0:
+            raise SocksAuthError("the SOCKS proxy wants a login method OpenDM doesn't support")
+        host, port = dest
+        try:
+            addr = b"\x01" + socket.inet_pton(socket.AF_INET, host)
+        except OSError:
+            try:
+                addr = b"\x04" + socket.inet_pton(socket.AF_INET6, host.strip("[]"))
+            except OSError:
+                h = host.encode("idna")
+                addr = b"\x03" + bytes([len(h)]) + h
+        s.sendall(b"\x05\x01\x00" + addr + struct.pack(">H", port))
+        _, rep, _, atyp = _recv_n(s, 4)
+        if rep != 0:
+            raise SocksError(f"the SOCKS proxy could not connect: {_SOCKS_REPLY.get(rep, rep)}")
+        _recv_n(s, ({1: 4, 4: 16}.get(atyp) or _recv_n(s, 1)[0]) + 2)
+        return s
+    except BaseException:
+        s.close()
+        raise
+
+
+def _socks_open(cfg, host, port, timeout):
+    t = timeout if isinstance(timeout, (int, float)) else 30
+    return socks5_connect((cfg["host"], cfg["port"]), (host, port), cfg.get("user", ""), cfg.get("pass", ""), t)
+
+
+class _SocksHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *a, cfg=None, **k):
+        super().__init__(*a, **k)
+        self._cfg = cfg
+
+    def connect(self):
+        self.sock = _socks_open(self._cfg, self.host, self.port, self.timeout)
+
+
+class _SocksHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *a, cfg=None, **k):
+        super().__init__(*a, **k)
+        self._cfg = cfg
+
+    def connect(self):
+        sock = _socks_open(self._cfg, self.host, self.port, self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _SocksHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, cfg, bypass):
+        super().__init__()
+        self.cfg, self.bypass = cfg, bypass
+
+    def http_open(self, req):
+        direct = bypass_match(_host_of(req.full_url), self.bypass)
+        return self.do_open(http.client.HTTPConnection if direct else functools.partial(_SocksHTTPConnection, cfg=self.cfg), req)
+
+
+if ssl:
+    class _SocksHTTPSHandler(urllib.request.HTTPSHandler):
+        def __init__(self, cfg, bypass):
+            super().__init__()
+            self.cfg, self.bypass = cfg, bypass
+
+        def https_open(self, req):
+            direct = bypass_match(_host_of(req.full_url), self.bypass)
+            return self.do_open(http.client.HTTPSConnection if direct else functools.partial(_SocksHTTPSConnection, cfg=self.cfg), req, context=self._context)
+else:
+    _SocksHTTPSHandler = None
+
+
+class _Proxy(urllib.request.ProxyHandler):
+    """Manual HTTP proxy: like ProxyHandler, but with our own 'don't use it for these hosts' list."""
+
+    def __init__(self, proxies, bypass):
+        super().__init__(proxies)
+        self.bypass = bypass
+
+    def proxy_open(self, req, proxy, type):
+        if bypass_match(_host_of(req.full_url), self.bypass):
+            return None
+        return super().proxy_open(req, proxy, type)
+
+
+class _Logins(urllib.request.HTTPPasswordMgrWithDefaultRealm):
+    """Which user name / password to give a server that asks for one (HTTP Basic or Digest): looked up by host name."""
+
+    def __init__(self):
+        super().__init__()
+        self.by_host = {}
+
+    def find_user_password(self, realm, authuri):
+        u = authuri[0] if isinstance(authuri, (list, tuple)) else authuri
+        return self.by_host.get(_host_of(u), (None, None))
+
+
+def _clamp_int(v, lo, hi, default):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+class Net:
+    """Every connection OpenDM makes goes through here, so the proxy and the site logins can be changed while it runs."""
+
+    def __init__(self):
+        self.cfg, self.proxy_url, self.logins = {}, "", _Logins()
+        self.configure({})
+
+    def configure(self, st):
+        st = st or {}
+        self.cfg = {k: st.get(k) for k in PROXY_KEYS}
+        # Configuration > Connection / Save to / Downloads
+        self.timeout, self.retries = _clamp_int(st.get("timeout"), 5, 300, 30), _clamp_int(st.get("retries"), 0, 30, 6)
+        self.temp_folder, self.overwrite = str(st.get("temp_folder") or "").strip(), st.get("file_exists") == "overwrite"
+        self.logins = _Logins()
+        mode, bypass, handlers = st.get("proxy_mode") or "system", parse_bypass(st.get("proxy_bypass")), [_Redirect()]
+        self.proxy_url = ""
+        if mode == "none":
+            handlers.append(urllib.request.ProxyHandler({}))
+        elif mode == "manual" and st.get("proxy_host"):
+            self.proxy_url = proxy_url(st)
+            if st.get("proxy_type") == "socks5":
+                cfg = {"host": st["proxy_host"].strip(), "port": proxy_port(st), "user": st.get("proxy_user") or "", "pass": st.get("proxy_pass") or ""}
+                handlers += [urllib.request.ProxyHandler({}), _SocksHTTPHandler(cfg, bypass)] + ([_SocksHTTPSHandler(cfg, bypass)] if _SocksHTTPSHandler else [])
+            else:
+                handlers.append(_Proxy({"http": self.proxy_url, "https": self.proxy_url}, bypass))
+        handlers += [urllib.request.HTTPBasicAuthHandler(self.logins), urllib.request.HTTPDigestAuthHandler(self.logins)]
+        self._opener = urllib.request.build_opener(*handlers)  # no proxy handler of our own = urllib's default: the system / environment proxy
+        for x in st.get("site_logins") or []:
+            if isinstance(x, dict) and x.get("host"):
+                self.add_login(x["host"], x.get("user", ""), x.get("pass", ""))
+
+    def add_login(self, host, user, password):
+        self.logins.by_host[_host_of(host)] = (user, password)
+
+    def login_for(self, url):
+        v = self.logins.by_host.get(_host_of(url))
+        return v if v and v != (None, None) else None
+
+    def open(self, req, timeout=None):
+        return self._opener.open(req, timeout=timeout)
+
+    def ffmpeg_proxy_args(self):
+        """ffmpeg only knows HTTP proxies (not SOCKS)."""
+        return ["-http_proxy", self.proxy_url] if self.proxy_url.startswith("http://") else []
+
+
+OPENER = Net()
+NET = OPENER  # live network / save settings (timeout, retries, temp folder, overwrite) next to the proxy and logins
+
+
+# ============================ Configuration: browser capture rules, click / typing sounds, start with the computer ============================
+def parts_dir(path):
+    """Where the pieces of a segmented (HLS) download are kept: next to the file, or in the temp folder from Configuration > Save to."""
+    if OPENER.temp_folder:
+        return os.path.join(OPENER.temp_folder, os.path.basename(path) + ".parts")
+    return path + ".parts"
+
+
+
+# ---- which browser downloads does OpenDM take over? (Configuration > File types; the extension reads the same rules) ----
+DEFAULT_SKIP_TYPES = "jpg jpeg png gif webp bmp svg ico avif heic tif tiff css js mjs map html htm json xml woff woff2 ttf otf"
+BROWSER_NAMES = (("chrome", "Google Chrome"), ("edge", "Microsoft Edge"), ("brave", "Brave Browser"), ("firefox", "Mozilla Firefox"), ("other", "Other Chromium browsers (Opera, Vivaldi ...)"))
+KEY_CHOICES = ("none", "alt", "ctrl", "shift")
+
+
+def split_list(text):
+    return [x.strip().lower().lstrip(".*") for x in re.split(r"[\s,;]+", str(text or "")) if x.strip().lstrip(".*")]
+
+
+def site_excluded(host, sites_text):
+    h = (host or "").lower()
+    for p in re.split(r"[\s,;]+", str(sites_text or "").lower()):
+        p = p.strip()
+        if p and (fnmatch.fnmatch(h, p) or h == p.lstrip("*.") or h.endswith("." + p.lstrip("*."))):
+            return True
+    return False
+
+
+def capture_decision(st, url, filename="", forced=False):
+    """Should OpenDM take this link over from the browser? Same rules as the extension: excluded site -> no; skip list (images, web assets) -> no;
+    capture list -> yes; anything else -> the 'unknown types' switch."""
+    p = urllib.parse.urlsplit(url or "")
+    if p.scheme not in ("http", "https"):
+        return False
+    if not forced and site_excluded(p.hostname, st.get("exclude_sites")):
+        return False
+    if forced:
+        return True
+    ext = os.path.splitext(filename or "")[1].lstrip(".").lower() or url_ext(url)
+    if ext in split_list(st.get("skip_types")):
+        return False
+    if ext in split_list(st.get("capture_types")):
+        return True
+    return bool(st.get("capture_unknown", True))
+
+
+def browser_config(st):
+    """What the browser extension needs to know (served on /config and by the native host)."""
+    br = st.get("capture_browsers") if isinstance(st.get("capture_browsers"), dict) else {}
+    key = lambda k, d: st.get(k) if st.get(k) in KEY_CHOICES else d
+    return {"intercept": bool(st.get("capture_downloads", True)), "capture_types": split_list(st.get("capture_types")),
+            "skip_types": split_list(st.get("skip_types")), "capture_unknown": bool(st.get("capture_unknown", True)),
+            "exclude_sites": split_list(st.get("exclude_sites")), "min_size_kb": _clamp_int(st.get("min_size_kb"), 0, 10 ** 9, 0),
+            "key_prevent": key("key_prevent", "alt"), "key_force": key("key_force", "none"),
+            "browsers": {k: bool(br.get(k, True)) for k, _ in BROWSER_NAMES},
+ "ctx_link": bool(st.get("ctx_link", True)), "ctx_media": bool(st.get("ctx_media", True)), "video_button": bool(st.get("video_button", True))}
+
+
+# ---- start with the computer ----
+def set_autostart(enabled, cmd=None, home=None):
+    """Start OpenDM (minimized) when the user signs in. Returns '' or an error text."""
+    cmd = cmd or launch_command()
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as k:
+                if enabled:
+                    winreg.SetValueEx(k, "OpenDM", 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+                else:
+                    try:
+                        winreg.DeleteValue(k, "OpenDM")
+                    except FileNotFoundError:
+                        pass
+            return ""
+        home = home or os.path.expanduser("~")
+        if platform.system() == "Darwin":
+            path = os.path.join(home, "Library", "LaunchAgents", "org.opendm.plist")
+            body = ('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>org.opendm</string>'
+                    "<key>ProgramArguments</key><array>" + "".join(f"<string>{html_escape(c)}</string>" for c in cmd) + "</array>"
+                    "<key>RunAtLoad</key><true/></dict></plist>\n")
+        else:
+            path = os.path.join(home, ".config", "autostart", "opendm.desktop")
+            body = "[Desktop Entry]\nType=Application\nName=OpenDM\nComment=Download manager\nExec=" + " ".join(shlex.quote(c) for c in cmd) + "\nTerminal=false\n"
+        if enabled:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+        elif os.path.exists(path):
+            os.remove(path)
+        return ""
+    except Exception as e:
+        return str(e)
+
+
+def html_escape(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def check_proxy(st, url="http://example.com/", timeout=10):
+    """(ok, message): can a request get out through the proxy described by settings `st`?"""
+    n = Net()
+    n.configure(st)
+    try:
+        with n.open(urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA}), timeout=timeout) as r:
+            return True, f"Works - the proxy answered (HTTP {r.status})"
+    except urllib.error.HTTPError as e:
+        if e.code == 407:
+            return False, "The proxy wants a (correct) user name and password"
+        return True, f"The proxy answered (HTTP {e.code})"
+    except Exception as e:
+        return False, str(getattr(e, "reason", None) or e)
+
+
+def is_transient(e):
+    """Is this failure worth trying again later (network trouble, a busy server) rather than a refusal that won't change?"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (408, 425, 429) or e.code >= 500
+    why = getattr(e, "reason", e)  # urllib wraps the real error in a URLError
+    if isinstance(why, SocksAuthError) or (ssl and isinstance(why, ssl.SSLCertVerificationError)):
+        return False  # a wrong proxy password / a bad certificate won't fix itself
+    return isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, ftplib.error_temp, EOFError)) or bool(ssl and isinstance(e, ssl.SSLError))
+
+
+def retry_after(e, cap=120):
+    """Seconds the server asked us to wait (Retry-After header, seconds or a date); 0 if it didn't."""
+    h = getattr(e, "headers", None)
+    v = (h.get("Retry-After") if h is not None else "") or ""
+    v = v.strip()
+    if v.isdigit():
+        return min(int(v), cap)
+    try:
+        return max(0, min(cap, int(email.utils.parsedate_to_datetime(v).timestamp() - time.time())))
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def default_net_check():
+    """True if the internet (or the configured proxy) can be reached at all - so retries aren't wasted while the network is down."""
+    cfg = OPENER.cfg
+    if cfg.get("proxy_mode") == "manual" and cfg.get("proxy_host"):
+        targets = [(cfg["proxy_host"].strip(), proxy_port(cfg))]
+    else:
+        targets = [("1.1.1.1", 443), ("8.8.8.8", 53), ("9.9.9.9", 443)]
+        for v in urllib.request.getproxies().values():  # behind a company proxy the outside world isn't reachable directly
+            p = urllib.parse.urlsplit(v if "//" in v else "//" + v)
+            if p.hostname:
+                targets.insert(0, (p.hostname, p.port or 80))
+    for t in targets:
+        try:
+            socket.create_connection(t, timeout=2.5).close()
+            return True
+        except OSError:
+            continue
+    return False
 
 
 class Limiter:
@@ -1171,6 +1889,8 @@ def media_site(url):
 def detect_kind(url):
     """Which engine a link needs: 'hls' (.m3u8), 'dash' (.mpd), 'ytdlp' (video sites), or None (plain file)."""
     low = (url or "").lower()
+    if low.startswith(("ftp://", "ftps://")):
+        return "ftp"
     if ".m3u8" in low:
         return "hls"
     if urllib.parse.urlparse(low).path.endswith(".mpd"):
@@ -1201,7 +1921,7 @@ def ytdlp_opts(quality=0, referer=None, cookie=None, ua=None):
     so DASH sites (Facebook / Instagram / Reels) never end up silent. Cookies are applied with apply_cookies()."""
     q = int(quality or 0)
     h = f"[height<={q}]" if q > 0 else ""
-    o = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30, "retries": 5,
+    o = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": NET.timeout, "retries": max(0, NET.retries - 1),
          "merge_output_format": "mp4",
          "format": "ba[ext=m4a]/ba/b" if q < 0 else f"bv*{h}[ext=mp4]+ba[ext=m4a]/bv*{h}+ba/b{h}/b"}  # quality -1 = audio only
     ff = find_ffmpeg()
@@ -1210,6 +1930,10 @@ def ytdlp_opts(quality=0, referer=None, cookie=None, ua=None):
     hdr = {k: v for k, v in (("User-Agent", ua), ("Referer", referer)) if v}
     if hdr:
         o["http_headers"] = hdr
+    if OPENER.proxy_url:
+        o["proxy"] = OPENER.proxy_url  # same proxy as the rest of OpenDM
+    elif OPENER.cfg.get("proxy_mode") == "none":
+        o["proxy"] = ""  # explicitly direct
     return o
 
 
@@ -1294,9 +2018,423 @@ def ytdlp_resolve(url, quality=0, referer=None, cookie=None, ua=None):
     return plan
 
 
+# ============================ wave 2: antivirus, smart links, clipboard history, toolbar layout ============================
+# Everything in this block is plain Python (no tkinter), so it is unit-tested without a display.
+
+# ---------- antivirus: ask an engine that is already installed; OpenDM bundles none ----------
+AV_TIMEOUT = 600  # seconds one scan may take before it is given up
+AV_NAMES = {"defender": "Windows Defender", "clamav": "ClamAV"}
+
+
+def _version_key(path):
+    return tuple(int(x) for x in re.findall(r"\d+", os.path.basename(os.path.dirname(path)))) or (0,)
+
+
+def find_av(prefer="auto", system=None, env=None, which=shutil.which, isfile=os.path.isfile, globber=glob.glob):
+    """Locate an installed scanner. Returns (engine, path) or None. engine: 'defender' (MpCmdRun.exe) or 'clamav' (clamscan).
+    prefer: 'auto' (Defender first, then ClamAV), 'defender' or 'clamav' (only that one)."""
+    system = system or platform.system()
+    env = os.environ if env is None else env
+    defender = clam = None
+    if system == "Windows":
+        plat = sorted(globber(os.path.join(env.get("ProgramData") or r"C:\ProgramData", "Microsoft", "Windows Defender", "Platform", "*", "MpCmdRun.exe")), key=_version_key)
+        cands = plat[-1:] + [os.path.join(env.get("ProgramFiles") or r"C:\Program Files", "Windows Defender", "MpCmdRun.exe")]
+        defender = next((c for c in cands if isfile(c)), None) or which("MpCmdRun.exe")
+    clam_c = [which("clamscan"), which("clamscan.exe")]
+    if system == "Windows":
+        clam_c += [os.path.join(env.get(k) or "", "ClamAV", "clamscan.exe") for k in ("ProgramFiles", "ProgramFiles(x86)")]
+    elif system == "Darwin":
+        clam_c += ["/opt/homebrew/bin/clamscan", "/usr/local/bin/clamscan"]
+    clam = next((c for c in clam_c if c and isfile(c)), None)
+    found = {"defender": defender, "clamav": clam}
+    for name in ([prefer] if prefer in found else ["defender", "clamav"]):
+        if found[name]:
+            return name, found[name]
+    return None
+
+
+def av_command(engine, exe, path):
+    if engine == "defender":
+        # -ScanType 3 = custom scan of one file; -DisableRemediation = report only, never delete or quarantine behind the user's back
+        return [exe, "-Scan", "-ScanType", "3", "-File", path, "-DisableRemediation"]
+    return [exe, "--no-summary", path]
+
+
+def parse_av(engine, code, out):
+    """(state, threat) from an engine's exit code and output. state: 'clean' | 'infected' | 'error'."""
+    if engine == "defender":  # MpCmdRun: 0 = no threats, 2 = threats found
+        if code == 0:
+            return "clean", ""
+        if code == 2:
+            names = [n.strip() for n in re.findall(r"^\s*Threat\s*:\s*(.+?)\s*$", out, re.M)]
+            return "infected", ", ".join(dict.fromkeys(names)) or "a threat"
+        return "error", ""
+    if code == 0:  # clamscan: 0 = clean, 1 = virus found, 2 = error
+        return "clean", ""
+    if code == 1:
+        names = [n.strip() for n in re.findall(r"^.*?:\s*(\S.*?)\s+FOUND\s*$", out, re.M)]
+        return "infected", ", ".join(dict.fromkeys(names)) or "a threat"
+    return "error", ""
+
+
+def scan_file(path, prefer="auto", runner=subprocess.run, finder=find_av, timeout=AV_TIMEOUT):
+    """Scan one file with the installed antivirus. Returns {'state': clean|infected|error|unavailable, 'engine', 'threat', 'detail'}."""
+    found = finder(prefer)
+    if not found:
+        return {"state": "unavailable", "engine": "", "threat": "", "detail": "No antivirus found (Windows Defender or ClamAV)."}
+    engine, exe = found
+    res = {"state": "error", "engine": engine, "threat": "", "detail": ""}
+    if not path or not os.path.isfile(path):
+        res["detail"] = "The file is gone."
+        return res
+    try:
+        r = runner(av_command(engine, exe, path), capture_output=True, text=True, errors="replace", timeout=timeout, **_ff_flags())
+    except subprocess.TimeoutExpired:
+        res["detail"] = f"{AV_NAMES[engine]} took longer than {timeout // 60} minutes."
+        return res
+    except (OSError, subprocess.SubprocessError) as e:
+        res["detail"] = f"Couldn't start {AV_NAMES[engine]}: {e}"
+        return res
+    state, threat = parse_av(engine, r.returncode, (r.stdout or "") + "\n" + (r.stderr or ""))
+    res.update(state=state, threat=threat)
+    if state == "error":
+        res["detail"] = f"{AV_NAMES[engine]} stopped with error code {r.returncode}."
+    return res
+
+
+def av_summary(res):
+    """One line for the Download complete dialog / properties."""
+    name = AV_NAMES.get(res.get("engine"), "")
+    return {"clean": f"{name}: no threats found.", "infected": f"WARNING: {name} found {res.get('threat') or 'a threat'}.",
+            "error": f"The virus scan didn't finish. {res.get('detail', '')}".strip(),
+            "unavailable": "Not scanned: no antivirus found (Windows Defender or ClamAV)."}.get(res.get("state"), "")
+
+
+# ---------- smart links: find the real file behind redirects, shorteners and download pages ----------
+_WRAPPERS = (  # (host, path prefix, query keys that carry the real address): well-known "you are leaving" redirectors
+    ("google.com", "/url", ("q", "url")), ("facebook.com", "/l.php", ("u",)), ("out.reddit.com", "", ("url",)),
+    ("safelinks.protection.outlook.com", "", ("url",)), ("youtube.com", "/redirect", ("q",)), ("steamcommunity.com", "/linkfilter", ("url", "u")),
+    ("vk.com", "/away.php", ("to",)), ("disq.us", "/url", ("url",)), ("slack-redir.net", "", ("url",)), ("l.instagram.com", "", ("u",)))
+_REDIRECTOR_WORDS = {"redirect", "redir", "away", "away.php", "out", "go", "goto", "click", "link", "url", "exit", "r", "l", "l.php", "jump", "leave", "external", "outbound", "redirect.php"}
+_WRAP_KEYS = ("url", "u", "q", "target", "dest", "destination", "redirect", "redirect_url", "redirect_uri", "link", "to", "goto", "out", "r", "href", "l")
+DL_EXTS = {"zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "tar", "iso", "img", "exe", "msi", "dmg", "pkg", "deb", "rpm", "apk", "appimage", "pdf", "epub", "mobi",
+           "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "mp4", "mkv", "avi", "mov", "webm", "mp3", "flac", "wav", "ogg", "m4a", "torrent"}
+_IMG_EXTS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"}
+_DL_WORDS = re.compile(r"download|t[eé]l[eé]charg|descarg|herunterlad|scarica|baixar|direct\s*link|get\s*(?:the\s*)?file", re.I)
+_AD_WORDS = re.compile(r"\bads?\b|advert|sponsor|promo|affiliate|casino|\bbet(?:ting)?\b|install\s*now|win\s*a\s", re.I)
+_PAYWALL = re.compile(r"subscribe\s+to\s+(?:continue|read|download)|subscribers?\s+only|paywall|members?\s+only|premium\s+members?|(?:sign|log)\s*in\s+to\s+(?:continue|download|view)", re.I)
+
+
+def _decode_target(v):
+    v = (v or "").strip()
+    if v.lower().startswith(("http://", "https://")):
+        return v
+    if v.startswith("aHR0c"):  # base64 of "http"
+        try:
+            t = base64.urlsafe_b64decode(v + "=" * (-len(v) % 4)).decode("utf-8", "replace")
+            return t if t.lower().startswith(("http://", "https://")) else ""
+        except (ValueError, TypeError):
+            return ""
+    t = urllib.parse.unquote(v)
+    return t if t.lower().startswith(("http://", "https://")) else ""
+
+
+def _unwrap_once(url):
+    p = urllib.parse.urlparse(url)
+    host, qs = (p.hostname or "").lower(), urllib.parse.parse_qs(p.query)
+    if host == "href.li" and p.query.lower().startswith("http"):
+        return _decode_target(p.query)
+    for h, prefix, keys in _WRAPPERS:
+        if (host == h or host.endswith("." + h)) and p.path.startswith(prefix):
+            for k in keys:
+                t = _decode_target((qs.get(k) or [""])[0])
+                if t:
+                    return t
+    if p.path.rstrip("/").rsplit("/", 1)[-1].lower() in _REDIRECTOR_WORDS:  # a path like /redirect, /away.php, /out ...
+        for k in _WRAP_KEYS:
+            t = _decode_target((qs.get(k) or [""])[0])
+            if t:
+                return t
+    return ""
+
+
+def unwrap_url(url, max_depth=5):
+    """Peel redirect wrappers (google.com/url?q=..., facebook l.php?u=..., /redirect?url=<base64>...) with no network. Returns (url, [each step's address])."""
+    steps = []
+    for _ in range(max_depth):
+        nxt = _unwrap_once(url)
+        if not nxt or nxt == url:
+            break
+        steps.append(nxt)
+        url = nxt
+    return url, steps
+
+
+class _AnchorParser(html.parser.HTMLParser):
+    """Links with their text, the way a person sees them, plus <meta refresh>."""
+
+    def __init__(self, base):
+        super().__init__(convert_charrefs=True)
+        self.base, self.anchors, self.refresh, self._cur = base, [], "", None
+
+    def _flush(self):
+        if self._cur:
+            self._cur["text"] = " ".join(self._cur["text"].split())
+            self.anchors.append(self._cur)
+            self._cur = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "a" and a.get("href", "").strip() and not a["href"].strip().lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:", "blob:")):
+            self._flush()
+            u = urllib.parse.urldefrag(urllib.parse.urljoin(self.base, a["href"].strip()))[0]
+            if u.lower().startswith(("http://", "https://")):
+                self._cur = {"url": u, "text": "", "download": "download" in a, "rel": a.get("rel", "").lower(), "cls": (a.get("class", "") + " " + a.get("id", "")).lower()}
+        elif tag == "meta" and a.get("http-equiv", "").lower() == "refresh":
+            m = re.search(r"url\s*=\s*['\"]?([^'\";]+)", a.get("content", ""), re.I)
+            if m:
+                self.refresh = urllib.parse.urljoin(self.base, m.group(1).strip())
+
+    def handle_data(self, data):
+        if self._cur is not None:
+            self._cur["text"] += data
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._flush()
+
+    def close(self):
+        super().close()
+        self._flush()
+
+
+_JS_REDIRECT = (re.compile(r"""(?:window\.|document\.|top\.|self\.)?location(?:\.href)?\s*=\s*["']([^"'\s]+)["']"""),
+                re.compile(r"""location\.(?:replace|assign)\(\s*["']([^"'\s]+)["']\s*\)"""))
+
+
+def page_links(body, base):
+    """(anchors, redirect): the page's links with their text, and where the page itself sends the browser (meta refresh / simple JavaScript), if anywhere."""
+    p = _AnchorParser(base)
+    try:
+        p.feed(body)
+        p.close()
+    except Exception:
+        pass
+    redirect = p.refresh
+    if not redirect:
+        for rx in _JS_REDIRECT:
+            m = rx.search(body)
+            if m and not m.group(1).startswith(("#", "javascript:")):
+                redirect = urllib.parse.urljoin(base, m.group(1))
+                break
+    return p.anchors, ("" if redirect == base else redirect)
+
+
+def score_link(a, page_url):
+    """How likely a link on a download page is *the* file. Plain rules, no network, nothing sent anywhere."""
+    u, text = a["url"], a.get("text", "")
+    ext = url_ext(u)
+    s = 50 if a.get("download") else 0
+    s += 45 if ext in DL_EXTS else 0
+    s += 25 if (_DL_WORDS.search(text) or _DL_WORDS.search(a.get("cls", ""))) else 0
+    s += 15 if re.search(r"/(?:download|dl|get|files?|attachments?)/|[?&](?:download|dl|export=download)\b", u, re.I) else 0
+    s += 10 if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(page_url).netloc else 0
+    s -= 60 if (_AD_WORDS.search(text + " " + a.get("cls", "")) or "sponsored" in a.get("rel", "")) else 0
+    s -= 40 if (ext in NOISE_EXTS or ext in _IMG_EXTS) else 0
+    s -= 100 if u == page_url else 0
+    return s
+
+
+def default_probe(url):
+    """Ask the server about a link without downloading the file: final address, status, type, and (for web pages) the first 512 KB."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+    try:
+        with OPENER.open(req, timeout=20) as r:
+            ctype, disp = r.headers.get("Content-Type") or "", r.headers.get("Content-Disposition") or ""
+            body = ""
+            if "html" in ctype.lower() and not disp:
+                body = r.read(512 * 1024).decode(r.headers.get_content_charset() or "utf-8", "replace")
+            return {"url": r.geturl(), "status": getattr(r, "status", 200), "type": ctype, "disp": disp, "size": r.headers.get("Content-Length"), "body": body}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(64 * 1024).decode("utf-8", "replace")
+        except OSError:
+            body = ""
+        return {"url": url, "status": e.code, "type": e.headers.get("Content-Type") or "", "disp": "", "size": None, "body": body}
+
+
+def _is_file_response(r):
+    if re.search(r"attachment|filename", r.get("disp") or "", re.I):
+        return True
+    return (r.get("type") or "").split(";")[0].strip().lower() not in ("text/html", "application/xhtml+xml")
+
+
+BLOCKED_NOTE = ("This page asks for a login, subscription or payment before it hands over the file. OpenDM doesn't get around that. "
+                "If you have an account, add the login under Options > Logins, or sign in in your browser and send the link with the OpenDM extension.")
+
+
+def resolve_link(url, probe=None, max_hops=6):
+    """Find the real file behind a link: peel redirect wrappers, follow shorteners and 'your download will start' pages, and pick the best download
+    link on a landing page. It never works around logins or paywalls - those are reported as 'blocked'.
+    Returns {'url', 'state', 'note', 'steps', 'candidates'}; state: direct | resolved | choose | blocked | none | failed | skip."""
+    probe = probe or default_probe
+    start = (url or "").strip()
+    res = {"url": start, "state": "failed", "note": "", "steps": [], "candidates": []}
+    if not start.lower().startswith(("http://", "https://")):
+        res.update(state="skip", note="Only http:// and https:// addresses can be resolved.")
+        return res
+    cur, wrapped = unwrap_url(normalize_url(start))
+    if wrapped:
+        res["steps"].append("Removed a redirect wrapper")
+    seen = set()
+    for _ in range(max_hops):
+        if cur in seen:
+            break
+        seen.add(cur)
+        try:
+            r = probe(cur)
+        except Exception as e:
+            res.update(url=cur, state="resolved" if cur != start else "failed", note=f"Couldn't reach the page: {e}")
+            return res
+        final = unwrap_url(r.get("url") or cur)[0]
+        if final != cur:
+            res["steps"].append("Followed a redirect")
+            cur = final
+        code = int(r.get("status") or 200)
+        if code in (401, 402, 403):
+            res.update(url=cur, state="blocked", note=BLOCKED_NOTE)
+            return res
+        if code >= 400:
+            res.update(url=cur, state="failed", note=f"The server answered HTTP {code}.")
+            return res
+        if _is_file_response(r):
+            res.update(url=cur, state="direct" if cur == start else "resolved", note="Already a direct file link." if cur == start else "Found the file.")
+            return res
+        anchors, nxt = page_links(r.get("body") or "", cur)
+        if nxt and nxt not in seen:
+            res["steps"].append("Followed the page's own redirect")
+            cur = nxt
+            continue
+        ranked = sorted(({"url": a["url"], "text": a["text"], "score": score_link(a, cur)} for a in anchors), key=lambda c: -c["score"])
+        ranked = [c for i, c in enumerate(ranked) if c["score"] >= 40 and all(c["url"] != x["url"] for x in ranked[:i])]
+        if not ranked:
+            if _PAYWALL.search(r.get("body") or ""):
+                res.update(url=cur, state="blocked", note=BLOCKED_NOTE)
+            else:
+                res.update(url=cur, state="none", note="No download link found on that page.")
+            return res
+        if len(ranked) == 1 or ranked[0]["score"] - ranked[1]["score"] >= 25:
+            res["steps"].append("Picked the best download link on the page")
+            cur = ranked[0]["url"]
+            continue
+        res.update(url=cur, state="choose", candidates=ranked[:8], note="Several links could be the file - pick one.")
+        return res
+    res.update(url=cur, state="resolved" if cur != start else "failed", note="Stopped after several steps." if cur != start else "Couldn't find a file.")
+    return res
+
+
+# ---------- clipboard history ----------
+CLIP_MAX = 100
+_CLIP_URL = re.compile(r"(?:https?|ftps?)://[^\s<>\"']+")
+
+
+def clip_urls(text):
+    """Every http / https / ftp / ftps address in some copied text, in order, without trailing punctuation."""
+    return list(dict.fromkeys(u.rstrip(".,;:!?)]}") for u in _CLIP_URL.findall(text or "")))
+
+
+class ClipHistory:
+    """The links the user copied: newest first, no duplicates, kept in clipboard.json (only addresses are stored, never other clipboard text)."""
+
+    def __init__(self, path=None, limit=CLIP_MAX):
+        self.path, self.limit, self.items = path, limit, []
+        try:
+            with open(path) as f:
+                rows = json.load(f)
+            self.items = [{"url": str(x["url"]), "t": float(x.get("t", 0))} for x in rows if isinstance(x, dict) and str(x.get("url", "")).startswith(URL_SCHEMES)][:limit]
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+
+    def add_text(self, text, now=None):
+        """Record the links in `text`. Returns the ones that are new (a link copied again just moves to the top)."""
+        now, new = time.time() if now is None else now, []
+        for u in reversed(clip_urls(text)):
+            if not any(x["url"] == u for x in self.items):
+                new.append(u)
+            self.items = [x for x in self.items if x["url"] != u]
+            self.items.insert(0, {"url": u, "t": now})
+        del self.items[self.limit:]
+        if new:
+            self.save()
+        return list(reversed(new))
+
+    def remove(self, urls):
+        drop = set(urls)
+        self.items = [x for x in self.items if x["url"] not in drop]
+        self.save()
+
+    def clear(self):
+        self.items = []
+        self.save()
+
+    def save(self):
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump(self.items, f)
+        except OSError:
+            pass
+
+
+# ---------- toolbar layout ----------
+# every toolbar button OpenDM knows: id -> (icon, label, App method). The first group is the classic IDM-style set (TOOLBAR, defined later).
+EXTRA_TOOLBAR = {"scan": ("scan", "Scan", "scan_selected"), "clip": ("clip", "Clipboard", "clipboard_dialog"), "widget": ("widget", "Widget", "toggle_widget")}
+TOOLBAR_STYLES, TOOLBAR_SIZES = ("both", "icons", "text"), ("large", "small")
+
+
+def toolbar_layout(saved, default, known):
+    """The toolbar as a list of button ids, with "|" for a separator. `saved` comes from settings.json, which may have been edited by hand:
+    unknown ids and repeats are dropped, separators never double up or sit at the ends, and an empty result falls back to the default."""
+    if not isinstance(saved, list):
+        return list(default)
+    out = []
+    for x in saved:
+        if x == "|" and out and out[-1] != "|":
+            out.append("|")
+        elif x in known and x not in out:
+            out.append(x)
+    while out and out[-1] == "|":
+        out.pop()
+    return out or list(default)
+
+
+# small vector glyphs for the buttons the classic icon set has no picture for: id -> [(x0, y0, x1, y1, colour)] on a 32x32 grid
+def _disc(cx, cy, r, colour):
+    return [(round(cx - (r * r - (y - cy) ** 2) ** 0.5), y, round(cx + (r * r - (y - cy) ** 2) ** 0.5), y, colour) for y in range(cy - r, cy + r + 1)]
+
+
+def _shield():
+    rows = []
+    for y in range(4, 29):
+        half = 11 if y <= 16 else max(1, round(11 - (y - 16) * 0.9))
+        rows.append((16 - half, y, 16 + half, y, "#16a34a"))
+    return rows + [(x, y, x + 2, y + 2, "#ffffff") for x, y in ((9, 14), (11, 16), (13, 18), (15, 16), (17, 14), (19, 12), (21, 10))]
+
+
+GLYPHS = {
+    "clip": [(7, 6, 25, 29, "#4b5563"), (9, 10, 23, 27, "#ffffff"), (12, 3, 20, 9, "#2563eb"), (11, 14, 21, 16, "#9ca3af"), (11, 19, 21, 21, "#9ca3af"), (11, 24, 18, 26, "#9ca3af")],
+    "scan": _shield(),
+    "widget": _disc(16, 16, 13, "#2563eb") + _disc(16, 16, 9, "#ffffff") + [(15, 9, 17, 18, "#2563eb"), (11, 16, 21, 17, "#2563eb"), (12, 17, 20, 18, "#2563eb"), (13, 18, 19, 19, "#2563eb"), (14, 19, 18, 20, "#2563eb"), (15, 20, 17, 21, "#2563eb")],
+}
+
+
+
 class Download:
     def __init__(self, url, folder, connections=8, referer=None, cookie=None, ua=None, hint=None):
-        self.url, self.folder, self.connections = normalize_url(url), folder, connections
+        url, self.login = split_login(normalize_url(url))  # credentials in the link (ftp://me:pw@host/f) are kept apart from the address
+        self.url, self.folder, self.connections = url, folder, connections
         self.referer, self.cookie, self.ua, self.hint = referer, cookie, ua, hint  # cookie is never saved to disk
         self.name = self.path = None
         self.size, self.ranges = -1, False
@@ -1314,21 +2452,27 @@ class Download:
         self.stop = threading.Event()
         self.failed = threading.Event()
         self.thread = None
+        self.checksum, self.verified, self.actual_hash, self._verifying = "", "", "", False  # expected 'algo:hex'; '' | 'ok' | 'bad' | 'missing'
+        self.scan, self.scan_info, self._scanning, self._scan_t0, self._scan_skip = "", "", False, 0.0, False  # antivirus: '' | 'clean' | 'infected' | 'error' | 'unavailable'
+        self.validator, self.replans, self.changed, self._resumed = "", 0, False, False  # ETag / Last-Modified, to notice a file that changed on the server
+        self.transient, self.retries, self.retry_at, self._auto_retry = False, 0, 0.0, False  # automatic retry bookkeeping (runtime only)
 
     # ---------- persistence ----------
     def to_dict(self):
-        keys = ("url", "folder", "base", "category", "auto_cat", "queue", "project", "desc", "last_try", "connections", "limit_kb", "referer", "ua", "hint", "name", "path", "size", "ranges", "segs", "status", "error")
+        keys = ("url", "folder", "base", "category", "auto_cat", "queue", "project", "desc", "last_try", "connections", "limit_kb", "referer", "ua", "hint", "name", "path", "size", "ranges", "segs", "status", "error",
+                "login", "checksum", "verified", "scan", "scan_info", "validator", "replans")
         d = {k: getattr(self, k) for k in keys}
         d["segs"] = [list(s) for s in self.segs]
         return d
 
     @classmethod
     def from_dict(cls, d):
-        cls = {"hls": HlsDownload, "mux": MuxDownload, "dash": DashDownload, "ytdlp": ExtractDownload, "ytnative": NativeYt}.get(d.get("kind"), cls)
+        cls = {"hls": HlsDownload, "mux": MuxDownload, "dash": DashDownload, "ytdlp": ExtractDownload, "ytnative": NativeYt, "ftp": FtpDownload}.get(d.get("kind"), cls)
         o = cls(d["url"], d["folder"], d.get("connections", 8))
         for k, v in d.items():
             setattr(o, k, v)
         o.limiter.set_rate(o.limit_kb * 1024)
+        o._scan_skip = o.status == "Completed"  # files finished in an earlier session or list are not scanned again behind the user's back
         if o.status in ACTIVE or o.status == "Queued":
             o.status = "Paused"
         getattr(o, "_loaded", lambda: None)()
@@ -1351,8 +2495,10 @@ class Download:
             h["Referer"] = self.referer
         if self.cookie and urllib.parse.urlparse(url).netloc == urllib.parse.urlparse(self.url).netloc:
             h["Cookie"] = self.cookie  # only ever sent to the host the browser gave us
+        if self.login:
+            OPENER.add_login(url, *self.login)  # given when the server asks for it (Basic / Digest), and only to this host
         req = urllib.request.Request(url, headers={**h, **(headers or {})})
-        return OPENER.open(req, timeout=30)
+        return OPENER.open(req, timeout=NET.timeout)
 
     def _fetch_head(self):
         """First KB of the file (ranged; plain GET if the server rejects Range). A web page is read further, for Google Drive's confirm form."""
@@ -1386,6 +2532,8 @@ class Download:
                 ct = (hdrs.get("Content-Type") or "").split(";")[0].strip().lower()
             if ct == "text/html":
                 raise IOError("Google Drive refused the download (private file, or its download quota is used up)")
+        etag = (hdrs.get("ETag") or "").strip()
+        self.validator = etag if etag and not etag.startswith("W/") else (hdrs.get("Last-Modified") or "").strip()  # a weak ETag can't be used with If-Range
         cr = hdrs.get("Content-Range")
         if status == 206 and cr and cr.split("/")[-1].isdigit():
             self.size, self.ranges = int(cr.split("/")[-1]), True
@@ -1412,10 +2560,19 @@ class Download:
         os.makedirs(self.folder, exist_ok=True)
         base, ext = os.path.splitext(self.name)
         path, i = os.path.join(self.folder, self.name), 1
+        if NET.overwrite and os.path.isfile(path):  # Configuration > Downloads: "replace the existing file"
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         while os.path.exists(path):
             path = os.path.join(self.folder, f"{base} ({i}){ext}")
             i += 1
         self.path = path
+        self._make_segs()
+        self._alloc()
+
+    def _make_segs(self):
         if self.ranges and self.size > 2 * 1024 * 1024:
             n = max(1, self.connections)
             step = -(-self.size // n)
@@ -1423,9 +2580,33 @@ class Download:
                          for i in range(n) if i * step < self.size]
         else:
             self.segs = [[0, self.size - 1 if self.size > 0 else None, 0]]
+
+    def _alloc(self):
         with open(self.path, "wb") as f:
             if self.size > 0:
                 f.truncate(self.size)
+
+    def _replan(self):
+        """The file changed on the server while we were away: ask again for its size, throw the old pieces away, start over (same file name)."""
+        self.replans += 1
+        name = self.name
+        self._probe()
+        self.name, self._resumed, self.note = name, False, ""
+        self._make_segs()
+        self._alloc()
+
+    def _stale(self):
+        """The server answered a resume with the whole file: our partial copy is from an older version of it. True = start over."""
+        with self.lock:
+            if self.changed:
+                return True
+            if self.replans >= 1:  # it keeps saying so (e.g. a CDN with a different ETag per server): stop trusting the check
+                self.validator = ""
+                return False
+            self.changed = True
+            self.note = "file changed on the server: starting over"
+            self.restart.set()
+            return True
 
     def segment_map(self):
         """[(x0, x1, filled_to)] in 0..1: the byte range of every connection's segment and how far it got."""
@@ -1456,13 +2637,67 @@ class Download:
         self.limit_kb = max(0, int(kb))
         self.limiter.set_rate(self.limit_kb * 1024)
 
+    # ---------- checksum ----------
+    def set_checksum(self, text):
+        """Expected hash ('' clears it). Raises ValueError if it isn't an MD5 / SHA-1 / SHA-256 / SHA-512 value."""
+        cs = normalize_checksum(text)
+        if cs != self.checksum:
+            self.checksum, self.verified, self.actual_hash = cs, "", ""
+
+    def verify(self, stop=None):
+        """Hash the finished file and compare it with the expected checksum. Sets .verified to 'ok', 'bad' or 'missing'."""
+        cs = parse_checksum(self.checksum)
+        if not cs:
+            self.verified = ""
+            return ""
+        self._verifying = True
+        try:
+            if not self.path or not os.path.isfile(self.path):
+                self.verified = "missing"
+            else:
+                got = hash_file(self.path, cs[0], stop)
+                if got is not None:  # None: cancelled
+                    self.actual_hash = got
+                    self.verified = "ok" if got == cs[1] else "bad"
+        except OSError:
+            self.verified = "missing"
+        finally:
+            self._verifying = False
+        return self.verified
+
+    def verify_async(self):
+        if not self._verifying:
+            self._verifying = True  # claimed now, so the scheduler doesn't start a second check
+            threading.Thread(target=self.verify, daemon=True).start()
+
+    def scan_async(self, prefer="auto", force=False):
+        """Scan the finished file with the installed antivirus, in the background. The verdict lands in .scan / .scan_info."""
+        if self._scanning or (self.scan and not force):
+            return
+        self._scanning, self._scan_t0, self.scan, self.scan_info = True, time.time(), "", ""  # claimed now, so the scheduler doesn't start a second scan
+        threading.Thread(target=self._scan, args=(prefer,), daemon=True).start()
+
+    def _scan(self, prefer):
+        try:
+            res = scan_file(self.path, prefer)
+            self.scan_info = av_summary(res)
+            self.scan = res["state"]
+        except Exception as e:  # never leave the flag stuck
+            self.scan_info, self.scan = f"The virus scan didn't finish. {e}", "error"
+        finally:
+            self._scanning = False
+
     # ---------- control ----------
     def start(self):
         if self.status in ACTIVE:
             return
         self.stop.clear()
         self.failed.clear()
-        self.error = ""
+        self.error, self.transient = "", False
+        if self._auto_retry:
+            self._auto_retry = False
+        else:
+            self.retries, self.retry_at = 0, 0.0  # a person pressed Resume: the automatic retries start counting again
         self.last_try = time.time()
         self.status = "Connecting"
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -1473,6 +2708,7 @@ class Download:
 
     def _run(self):
         try:
+            self._resumed = bool(self.segs)  # picking up an earlier attempt: ask the server whether the file is still the same one
             if not self.segs:
                 self._probe()
                 self._plan()
@@ -1496,7 +2732,11 @@ class Download:
                 for w in workers:
                     w.join()
                 if self.restart.is_set() and not self.stop.is_set():
-                    self._single_stream()  # the server won't do parallel / ranged transfers: carry on as one plain stream
+                    if self.changed:
+                        self.changed = False
+                        self._replan()  # the file changed on the server: begin again with its new size
+                    else:
+                        self._single_stream()  # the server won't do parallel / ranged transfers: carry on as one plain stream
                     continue
                 break
             if self.failed.is_set():
@@ -1505,11 +2745,11 @@ class Download:
                 if os.path.getsize(self.path) == 0:
                     self.error, self.status = "the server returned an empty file", "Error"
                 else:
-                    self.status = "Completed"
+                    self.status, self.retries = "Completed", 0
             else:
                 self.status = "Paused"
         except Exception as e:
-            self.error, self.status = str(e), "Error"
+            self.error, self.status, self.transient = str(e), "Error", is_transient(e)
         if self.status == "Error" and self.path and self.done == 0:
             self._scrap()
         self.speed = 0
@@ -1577,8 +2817,14 @@ class Download:
                 hdr = {}
                 if self.ranges:
                     hdr["Range"] = f"bytes={seg[2]}-{'' if end is None else end}"
+                    if self._resumed and self.validator:
+                        hdr["If-Range"] = self.validator  # "only if the file is still the one I started with"
                 with self._open(hdr) as r, open(self.path, "r+b") as f:
                     if self.ranges and r.status != 206:
+                        if "If-Range" in hdr and r.status == 200:
+                            if self._stale():
+                                return
+                            raise IOError("the file changed on the server; trying again without the check")
                         if self._downgrade("server ignored Range"):
                             return
                         raise IOError("server ignored Range request")
@@ -1605,15 +2851,16 @@ class Download:
                 if self.ranges and code in (400, 403, 405, 416, 429, 501) and self._downgrade(f"HTTP {code}"):
                     return
                 tries = 99 if code in (401, 403, 404, 410) else tries + 1  # permanent refusals aren't worth retrying
-                if tries > 6:
+                if tries > NET.retries:
                     if self._downgrade(str(e)):
                         return
-                    self.error = str(e)
+                    self.error, self.transient = str(e), is_transient(e)
                     self.failed.set()
                     return
                 if not self.ranges:
                     seg[2] = seg[0]  # a plain stream can't resume mid-file: begin again
-                time.sleep(min(2 * tries, 15))
+                if self.stop.wait(max(min(2 * tries, 15), retry_after(e))):  # a Retry-After from the server wins; Pause interrupts the wait
+                    return
 
     def update_speed(self):
         now, d = time.time(), self.done
@@ -1643,6 +2890,123 @@ class Download:
             return ""
         s = int((self.size - self.done) / self.speed)
         return f"{s // 3600:d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+class _Halt(Exception):
+    """Raised inside an FTP data callback to stop the transfer (pause / failure elsewhere)."""
+
+
+class FtpDownload(Download):
+    """ftp:// and ftps:// (explicit TLS): one connection, resumes with REST, user name / password from the link or from Options > Logins."""
+    kind = "ftp"
+
+    def __init__(self, url, folder, connections=1, **kw):
+        super().__init__(url, folder, 1, **kw)
+        self.connections = 1
+
+    def to_dict(self):
+        d = super().to_dict()
+        d.update(kind="ftp")
+        return d
+
+    def _creds(self, host):
+        if self.login:
+            return self.login[0], self.login[1]
+        got = OPENER.login_for(host)
+        return got if got else ("anonymous", "anonymous@")
+
+    def _ftp_connect(self):
+        p = urllib.parse.urlsplit(self.url)
+        ftp = (ftplib.FTP_TLS if p.scheme == "ftps" else ftplib.FTP)()
+        ftp.encoding = "utf-8"
+        ftp.connect(p.hostname, p.port or 21, timeout=30)
+        try:
+            ftp.login(*self._creds(p.hostname))
+            if p.scheme == "ftps":
+                ftp.prot_p()
+            ftp.voidcmd("TYPE I")
+        except BaseException:
+            ftp.close()
+            raise
+        return ftp, urllib.parse.unquote(p.path) or "/"
+
+    @staticmethod
+    def _bye(ftp):
+        try:
+            ftp.quit()
+        except Exception:
+            ftp.close()
+
+    def _probe(self):
+        ftp, path = self._ftp_connect()
+        try:
+            try:
+                size = ftp.size(path)
+            except ftplib.error_perm:
+                size = None
+            if size is None:  # no SIZE support, or a folder: a folder can be entered, a file can't
+                try:
+                    ftp.cwd(path)
+                except ftplib.error_perm:
+                    pass
+                else:
+                    raise IOError("that FTP address is a folder, not a file")
+            self.size = size if size is not None else -1
+            try:
+                ftp.sendcmd("REST 0")
+                self.ranges = self.size > 0
+            except ftplib.error_perm:
+                self.ranges = False
+        finally:
+            self._bye(ftp)
+        name = clean_name(self.hint or urllib.parse.unquote(os.path.basename(path.rstrip("/"))) or urllib.parse.urlsplit(self.url).hostname or "file")
+        self.name = name
+
+    def _fetch(self, seg):
+        tries = 0
+        while not self._halted():
+            end = seg[1]
+            if end is not None and seg[2] > end:
+                return
+            ftp = None
+            try:
+                ftp, path = self._ftp_connect()
+                with open(self.path, "r+b") as f:
+                    f.seek(seg[2])
+
+                    def sink(buf):
+                        nonlocal tries
+                        if self._halted():
+                            raise _Halt()
+                        f.write(buf)
+                        seg[2] += len(buf)
+                        tries = 0
+                        GLOBAL_LIMIT.wait(len(buf), self.stop)
+                        self.limiter.wait(len(buf), self.stop)
+                    ftp.retrbinary("RETR " + path, sink, blocksize=CHUNK, rest=seg[2] if seg[2] > 0 and self.ranges else None)
+                if seg[1] is None:
+                    seg[1] = seg[2] - 1  # unknown length: the end of the transfer is the end of the file
+                elif seg[2] <= seg[1]:
+                    raise IOError("connection closed early")
+                return
+            except _Halt:
+                return
+            except Exception as e:
+                tries = 99 if isinstance(e, ftplib.error_perm) else tries + 1  # 530 (login) / 550 (no such file) won't change by asking again
+                if tries > NET.retries:
+                    self.error, self.transient = str(e), is_transient(e)
+                    self.failed.set()
+                    return
+                if not self.ranges:
+                    seg[2] = seg[0]
+                if self.stop.wait(min(2 * tries, 15)):
+                    return
+            finally:
+                if ftp is not None:
+                    try:
+                        ftp.close()
+                    except Exception:
+                        pass
 
 
 # ============================ HLS video downloads ============================
@@ -1697,7 +3061,7 @@ class HlsDownload(Download):
 
     def discard(self):
         if self.path:
-            shutil.rmtree(self.path + ".parts", ignore_errors=True)
+            shutil.rmtree(parts_dir(self.path), ignore_errors=True)
 
     def segment_map(self):
         f, out, i = self.flags, [], 0
@@ -1824,13 +3188,13 @@ class HlsDownload(Download):
             n += 1
             name = f"{stem} ({n})"
         self.name, self.path = name + ext, os.path.join(self.folder, name + ext)
-        os.makedirs(self.path + ".parts", exist_ok=True)
+        os.makedirs(parts_dir(self.path), exist_ok=True)
         self.plan = {"tracks": tracks}
-        with open(os.path.join(self.path + ".parts", "plan.json"), "w") as f:
+        with open(os.path.join(parts_dir(self.path), "plan.json"), "w") as f:
             json.dump(self.plan, f)
 
     def _fn(self, track, i):
-        return os.path.join(self.path + ".parts", f"{track['name']}_{i:06d}.part")
+        return os.path.join(parts_dir(self.path), f"{track['name']}_{i:06d}.part")
 
     # ---------- downloading ----------
     def _get(self, url, br=None):
@@ -1872,7 +3236,8 @@ class HlsDownload(Download):
                 return
             t, i = job
             p, fn = t["parts"][i], self._fn(t, i)
-            for attempt in range(4):
+            tries_max = max(1, NET.retries - 2)
+            for attempt in range(tries_max):
                 try:
                     data = self._get(p["u"], p.get("br"))
                     if data is None:
@@ -1896,8 +3261,8 @@ class HlsDownload(Download):
                     self.failed.set()
                     return
                 except Exception as e:
-                    if attempt == 3:
-                        self.error = f"segment {i + 1}: {e}"
+                    if attempt == tries_max - 1:
+                        self.error, self.transient = f"segment {i + 1}: {e}", is_transient(e)
                         self.failed.set()
                         return
                     if self.stop.wait(1 + attempt * 2):
@@ -1905,7 +3270,7 @@ class HlsDownload(Download):
 
     def _run(self):
         try:
-            pf = os.path.join(self.path + ".parts", "plan.json") if self.path else None
+            pf = os.path.join(parts_dir(self.path), "plan.json") if self.path else None
             if pf and os.path.exists(pf):
                 with open(pf) as f:
                     self.plan = json.load(f)
@@ -1947,7 +3312,7 @@ class HlsDownload(Download):
         self.speed = 0
 
     def _finish(self):
-        pd = self.path + ".parts"
+        pd = parts_dir(self.path)
         base, ext = os.path.splitext(self.path)
         outs = []
         for t in self.plan["tracks"]:
@@ -2160,7 +3525,7 @@ class DashDownload(Download):
             self._last = (time.time(), 0)
             for ext, codec in ((".mp4", ["-c", "copy", "-movflags", "+faststart"]), (".mkv", ["-c", "copy"])):
                 tmp = base + ".opendm-part" + ext
-                proc = subprocess.Popen([ff, "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-headers", hdr, "-i", self.url, *codec, tmp],
+                proc = subprocess.Popen([ff, "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1", *OPENER.ffmpeg_proxy_args(), "-headers", hdr, "-i", self.url, *codec, tmp],
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", **_ff_flags())
                 errs = []
                 threading.Thread(target=lambda p=proc, e=errs: e.extend(p.stderr.read().splitlines()), daemon=True).start()
@@ -2399,12 +3764,31 @@ DEFAULT_SETTINGS = {"limit_kb": 0, "sched_on": False, "start": "01:00", "stop": 
                     "folder": "", "auto_sort": True, "categories": DEFAULT_CATEGORIES, "queues": [MAIN_QUEUE], "connections": 8, "max_active": 0,
                     "tray": True, "close_to_tray": True, "notify": True, "start_minimized": False,
                     "native_register": True, "autostart_from_browser": True, "extension_ids": [],
-                    "show_complete_dialog": True, "confirm_captured": True}
+                    "check_updates": True,
+                    "show_complete_dialog": True, "confirm_captured": True,
+                    "proxy_mode": "system", "proxy_type": "http", "proxy_host": "", "proxy_port": 0, "proxy_user": "", "proxy_pass": "",
+                    "proxy_bypass": "", "site_logins": [], "auto_retry": True, "retry_max": 5,
+                    "theme": "system", "accent": DEFAULT_ACCENT, "skin": "default",
+                    "av_scan": True, "av_engine": "auto", "smart_unwrap": True,
+                    "clip_watch": False, "widget_on": False, "widget_x": None, "widget_y": None, "widget_alpha": 90,
+                    "toolbar_items": None, "toolbar_style": "both", "toolbar_size": "large",
+                    "sound": True, "sound_complete": True, "sound_all_done": True, "sound_error": True, "sound_unfocused_only": False,
+                    "sound_quiet": False, "sound_quiet_from": "22:00", "sound_quiet_to": "07:00", "sound_files": {},
+                    # --- Configuration window (browser capture rules, saving, connection, click / typing sounds) ---
+                    "capture_downloads": True, "capture_types": " ".join(sorted({e for c in DEFAULT_CATEGORIES if c["name"] != "Images" for e in c["exts"]})),
+                    "skip_types": DEFAULT_SKIP_TYPES, "capture_unknown": True, "exclude_sites": "", "min_size_kb": 0,
+                    "key_prevent": "alt", "key_force": "none", "capture_browsers": {k: True for k, _ in BROWSER_NAMES},
+                    "ctx_link": True, "ctx_media": True, "video_button": True, "autostart": False, "clip_monitor": False,
+                    "temp_folder": "", "dup_links": "ask", "file_exists": "rename", "timeout": 30, "retries": 6,
+                    }
 
 
 class Manager:
+    NET_POLL, NET_FRESH = 5, 15  # seconds: how often the network is checked while retries wait, and how old a 'yes' may be
+
     def __init__(self, max_active=3, persist=True):
         self.items, self.max_active, self.persist = [], max_active, persist
+        self.scanner_on = False  # the window switches this on; the CLI and the tests scan only when asked
         self.settings = copy.deepcopy(DEFAULT_SETTINGS)
         self._busy, self._base = False, 0
         self.hist, self._hist_t = deque(maxlen=HIST), 0.0  # total speed, one sample per second
@@ -2419,15 +3803,63 @@ class Manager:
             d.router = self.route
             d.queue = d.queue if d.queue in self.settings["queues"] else MAIN_QUEUE
         GLOBAL_LIMIT.set_rate(self.settings["limit_kb"] * 1024)
+        self.net_check, self._net_up, self._net_done, self._net_start, self._net_busy = default_net_check, True, 0.0, 0.0, False
+        self.apply_network()
+
+    def apply_network(self):
+        """(Re)build the connection layer from the proxy / login settings."""
+        OPENER.configure(self.settings)
+
+    def will_retry(self, d):
+        st = self.settings
+        return bool(st.get("auto_retry", True) and d.status == "Error" and d.transient and d.retries < int(st.get("retry_max", 5) or 0))
+
+    def _net_poll(self, now):
+        """Is the network reachable? Asked in the background (never blocks the window). True only for a recent 'yes'."""
+        if now - self._net_start >= self.NET_POLL and not self._net_busy:
+            self._net_busy, self._net_start = True, now
+
+            def run():
+                try:
+                    ok = bool(self.net_check())
+                except Exception:
+                    ok = False
+                self._net_up, self._net_done, self._net_busy = ok, time.time(), False
+            threading.Thread(target=run, daemon=True).start()
+        return self._net_up and now - self._net_done < self.NET_FRESH
+
+    def _auto_retry_step(self, now):
+        """Failed downloads that failed for a temporary reason (network, busy server) are tried again after a growing pause - but only while the network is up."""
+        waiting = [d for d in self.items if self.will_retry(d)]
+        for d in self.items:
+            if d.retry_at and not any(d is w for w in waiting):
+                d.retry_at = 0.0
+        if not waiting:
+            return
+        online = self._net_poll(now)
+        for d in waiting:
+            if not d.retry_at:
+                d.retry_at = now + RETRY_DELAYS[min(d.retries, len(RETRY_DELAYS) - 1)]
+            elif now >= d.retry_at and online:
+                d.retries += 1
+                d.retry_at, d._auto_retry, d.status = 0.0, True, "Queued"
+
+    def find_duplicate(self, url):
+        """The download already in the list for this link (any status), or None."""
+        key = normalize_url(url.strip())
+        return next((d for d in self.items if d.url == key), None)
 
     def add(self, url, folder, connections=8, kind=None, **extra):
         url = url.strip()
         if kind is None:
-            kind = detect_kind(url)  # hls (.m3u8) / dash (.mpd) / ytdlp (YouTube, Facebook, Instagram ...) / plain file
+            kind = detect_kind(url)  # hls (.m3u8) / dash (.mpd) / ftp / ytdlp (YouTube, Facebook, Instagram ...) / plain file
+        checksum = normalize_checksum(extra.pop("checksum", ""))  # raises ValueError for a value that isn't a hash
         queue_name = extra.pop("queue", None) or MAIN_QUEUE
         project, later, desc = extra.pop("project", ""), extra.pop("later", False), extra.pop("desc", "")
         if kind == "mux":
             d = MuxDownload(url, folder, connections, **extra)
+        elif kind == "ftp":
+            d = FtpDownload(url, folder, connections, **extra)
         elif kind == "dash":
             d = DashDownload(url, folder, connections, quality=extra.pop("quality", None) or self.settings.get("quality", 0), **extra)
         elif kind == "ytdlp":
@@ -2446,8 +3878,8 @@ class Manager:
             guess += ".mp4"
         d.category = classify(self.settings["categories"], guess, url)  # provisional: refined once the real file name is known
         d.queue = queue_name if queue_name in self.settings["queues"] else MAIN_QUEUE
-        d.project = project
-        d.desc = desc or urllib.parse.urlparse(d.referer or url).netloc
+        d.project, d.checksum = project, checksum
+        d.desc = desc or urllib.parse.urlparse(d.referer or d.url).netloc
         if later:
             d.status = "Paused"  # "Download later": waits in its queue until you start it
         self.items.append(d)
@@ -2561,7 +3993,7 @@ class Manager:
             data = json.loads(text)
             rows = data["downloads"] if isinstance(data, dict) else data
             for x in rows:
-                if not isinstance(x, dict) or not str(x.get("url", "")).startswith(("http://", "https://")):
+                if not isinstance(x, dict) or not str(x.get("url", "")).startswith(URL_SCHEMES):
                     continue
                 if any(d.url == x["url"] and d.name == x.get("name") for d in self.items):
                     continue
@@ -2608,6 +4040,10 @@ class Manager:
         os.makedirs(CFG_DIR, exist_ok=True)
         with open(SETTINGS_FILE, "w") as f:
             json.dump(self.settings, f)
+        try:
+            os.chmod(SETTINGS_FILE, 0o600)  # it can hold a proxy password and site logins: this user only
+        except OSError:
+            pass
 
     def set_limit_kb(self, kb):
         self.settings["limit_kb"] = max(0, int(kb))
@@ -2633,6 +4069,16 @@ class Manager:
     # ----- queue + scheduler; returns True once when a batch of downloads has just finished -----
     def schedule(self):
         allowed = self.in_window()
+        now = time.time()
+        if self.settings.get("auto_retry", True):
+            self._auto_retry_step(now)
+        for d in self.items:
+            if d.status == "Completed" and d.checksum and not d.verified and not d._verifying:
+                d.verify_async()  # hash the finished file in the background
+        if self.scanner_on and self.settings.get("av_scan", True):
+            for d in self.items:
+                if d.status == "Completed" and not d.scan and not d._scanning and not d._scan_skip and d.path:
+                    d.scan_async(self.settings.get("av_engine", "auto"))
         for d in self.items:
             if allowed and d.auto_paused and d.status == "Paused":
                 d.auto_paused, d.status = False, "Queued"
@@ -2706,6 +4152,12 @@ class Manager:
         self.save()
 
 
+STALE_CAPTURE_SECS = 90      # a browser request older than this is ignored
+CAPTURE_DEDUPE_SECS = 30     # the same link offered again within this time is ignored
+CAPTURE_EXPIRE_SECS = 300    # a confirmation that waited this long unanswered is dropped
+CAPTURE_MAX_QUEUE = 10
+
+
 # ====================== Browser integration API ======================
 def get_token(state_dir=None):
     state_dir = state_dir or CFG_DIR
@@ -2723,12 +4175,6 @@ def get_token(state_dir=None):
         except OSError:
             pass
         return t
-
-
-STALE_CAPTURE_SECS = 90      # a browser request older than this is ignored
-CAPTURE_DEDUPE_SECS = 30     # the same link offered again within this time is ignored
-CAPTURE_EXPIRE_SECS = 300    # a confirmation that waited this long unanswered is dropped
-CAPTURE_MAX_QUEUE = 10
 
 
 def start_api(mgr, defaults, port=API_PORT, token=None, state_dir=None, confirm=None):
@@ -2777,6 +4223,8 @@ def start_api(mgr, defaults, port=API_PORT, token=None, state_dir=None, confirm=
         def do_GET(self):
             if self.path == "/ping" and self._auth():
                 self._send(200, {"app": "OpenDM", "version": 1})
+            elif self.path == "/config" and self._auth():
+                self._send(200, browser_config(mgr.settings))  # capture rules for the extension
 
         def _body(self):
             try:
@@ -2819,6 +4267,10 @@ def start_api(mgr, defaults, port=API_PORT, token=None, state_dir=None, confirm=
             if self.path == "/formats":
                 if self._auth():
                     self._formats()
+                return
+            if self.path == "/config":
+                if self._auth():
+                    self._send(200, browser_config(mgr.settings))
                 return
             if self.path != "/add" or not self._auth():
                 return
@@ -3227,6 +4679,13 @@ class NativeHost:
         if cmd == "ping":
             return {"ok": True, "app": "OpenDM", "version": __version__, "running": self.alive(), "port": self.port(),
                     "autostart": bool(self.settings().get("autostart_from_browser", True))}
+        if cmd == "config":  # capture rules from Configuration; never starts OpenDM just to ask
+            if not self.alive():
+                return {"ok": True, "running": False}
+            code, obj = self._json_call("/config", {}, timeout=10)
+            if code == 200 and isinstance(obj, dict):
+                return {"ok": True, "running": True, "config": obj}
+            raise HostError("OpenDM did not answer the settings request.")
         if cmd == "start":
             self.ensure_running()
             return {"ok": True}
@@ -3404,6 +4863,9 @@ TOOLBAR = (("add", "Add URL", "add_dialog"), ("resume", "Resume", "resume"), ("s
            ("options", "Options", "options_dialog"), ("scheduler", "Scheduler", "scheduler_dialog"), None,
            ("startq", "Start Queue", "start_queue"), ("stopq", "Stop Queue", "stop_queue"), None,
            ("grabber", "Grabber", "grabber_dialog"), ("browser", "Browser", "pairing_dialog"))
+TOOLBAR_ACTIONS = {e[0]: e for e in TOOLBAR if e}
+TOOLBAR_ACTIONS.update(EXTRA_TOOLBAR)
+DEFAULT_TOOLBAR = [e[0] if e else "|" for e in TOOLBAR]
 
 
 def _load_tk():
@@ -3411,6 +4873,380 @@ def _load_tk():
     import tkinter as _tk
     from tkinter import ttk as _ttk, messagebox as _mb, filedialog as _fd, simpledialog as _sd
     tk, ttk, messagebox, filedialog, simpledialog = _tk, _ttk, _mb, _fd, _sd
+
+
+class Tip:
+    """A small tooltip, for toolbar buttons that show only an icon."""
+
+    def __init__(self, widget, text):
+        self.w, self.text, self.tw, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._enter, add="+")
+        widget.bind("<Leave>", self._leave, add="+")
+        widget.bind("<ButtonPress>", self._leave, add="+")
+
+    def _enter(self, _=None):
+        self._leave()
+        self.job = self.w.after(500, self._show)
+
+    def _show(self):
+        self.job = None
+        try:
+            tw = self.tw = tk.Toplevel(self.w)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{self.w.winfo_rootx() + 10}+{self.w.winfo_rooty() + self.w.winfo_height() + 4}")
+            tk.Label(tw, text=self.text, background="#ffffe1", foreground="#000000", relief="solid", borderwidth=1, padx=4, pady=1).pack()
+        except tk.TclError:
+            self.tw = None
+
+    def _leave(self, _=None):
+        try:
+            if self.job:
+                self.w.after_cancel(self.job)
+            if self.tw:
+                self.tw.destroy()
+        except tk.TclError:
+            pass
+        self.job = self.tw = None
+
+
+def glyph_image(name):
+    """A 32x32 toolbar icon drawn from GLYPHS (for the buttons the classic icon set has no picture for)."""
+    img = tk.PhotoImage(width=32, height=32)
+    for x0, y0, x1, y1, colour in GLYPHS[name]:
+        img.put(colour, to=(x0, y0, x1 + 1, y1 + 1))
+    return img
+
+
+class FloatingWidget:
+    """A small always-on-top window with the total speed and a progress ring. Drag it anywhere, double-click to open OpenDM, right-click for a menu."""
+    W, H = 176, 54
+
+    def __init__(self, app):
+        self.app, self.win, self.cv, self._drag = app, None, None, None
+
+    @property
+    def shown(self):
+        try:
+            return bool(self.win and self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def show(self):
+        if self.shown:
+            return
+        app, st = self.app, self.app.mgr.settings
+        w = self.win = tk.Toplevel(app.root)
+        w.overrideredirect(True)
+        try:
+            w.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.set_alpha()
+        self.cv = tk.Canvas(w, width=self.W, height=self.H, highlightthickness=1, cursor="fleur")
+        self.cv.pack()
+        sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+        x, y = st.get("widget_x"), st.get("widget_y")
+        if not isinstance(x, int) or not isinstance(y, int):
+            x, y = sw - self.W - 40, sh - self.H - 120  # first time: bottom right
+        w.geometry(f"{self.W}x{self.H}+{max(0, min(x, sw - self.W))}+{max(0, min(y, sh - self.H))}")  # never off-screen, even if the monitor setup changed
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._move)
+        self.cv.bind("<ButtonRelease-1>", self._release)
+        self.cv.bind("<Double-Button-1>", lambda e: app.show_window())
+        for ev in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.cv.bind(ev, self._menu)
+        self.update()
+
+    def hide(self):
+        try:
+            if self.win:
+                self.win.destroy()
+        except tk.TclError:
+            pass
+        self.win = self.cv = None
+
+    def set_alpha(self):
+        try:
+            self.win.attributes("-alpha", max(0.3, min(1.0, int(self.app.mgr.settings.get("widget_alpha", 90)) / 100)))
+        except (tk.TclError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _press(self, e):
+        self._drag = (e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y(), e.x_root, e.y_root)
+
+    def _move(self, e):
+        if self._drag:
+            self.win.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
+
+    def _release(self, e):
+        if self._drag and (abs(e.x_root - self._drag[2]) > 3 or abs(e.y_root - self._drag[3]) > 3):  # it was dragged, not just clicked: remember where it is
+            self.app.mgr.settings["widget_x"], self.app.mgr.settings["widget_y"] = self.win.winfo_x(), self.win.winfo_y()
+            self.app.mgr.save_settings()
+        self._drag = None
+
+    def _menu(self, e):
+        app = self.app
+        m = tk.Menu(self.win, tearoff=0)
+        m.add_command(label="Open OpenDM", command=app.show_window)
+        m.add_command(label="Add URL...", command=lambda: (app.show_window(), app.add_dialog()))
+        m.add_command(label="Download links from the clipboard", command=app.add_from_clipboard)
+        m.add_separator()
+        m.add_command(label="Stop all", command=app.stop_all)
+        m.add_command(label="Start queue", command=app.start_queue)
+        m.add_separator()
+        op = tk.Menu(m, tearoff=0)
+        for pct in (100, 80, 60, 40):
+            op.add_command(label=f"{pct}%", command=lambda p=pct: self.opacity(p))
+        m.add_cascade(label="Opacity", menu=op)
+        m.add_command(label="Hide widget", command=lambda: app.toggle_widget(False))
+        app._popup(m, e)
+
+    def opacity(self, pct):
+        self.app.mgr.settings["widget_alpha"] = pct
+        self.app.mgr.save_settings()
+        self.set_alpha()
+
+    def update(self):
+        if not self.shown or not self.cv:
+            return
+        p, items = PAL, self.app.mgr.items
+        act = [d for d in items if d.status in ACTIVE]
+        known = [d for d in act if d.size > 0]
+        frac = (sum(min(d.done, d.size) for d in known) / sum(d.size for d in known)) if known else 0.0
+        cv, (cx, cy, r) = self.cv, (28, 27, 17)
+        cv.configure(bg=p["panel"], highlightbackground=p["border"])
+        cv.delete("all")
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline=p["grid"], width=5)
+        if act and frac > 0:
+            cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=90, extent=-min(359.9, 360 * frac), style="arc", outline=p["accent"], width=5)
+        cv.create_text(cx, cy, text=f"{int(frac * 100)}%" if known else ("\u2193" if act else "\u2713"), fill=p["fg"], font=("TkDefaultFont", 9, "bold"))
+        waiting = sum(d.status == "Queued" for d in items)
+        cv.create_text(58, 19, anchor="w", text=(fmt_rate(sum(d.speed for d in act)) or "Starting...") if act else "Idle", fill=p["fg"], font=("TkDefaultFont", 10, "bold"))
+        cv.create_text(58, 37, anchor="w", text=f"{len(act)} active" + (f", {waiting} queued" if waiting else ""), fill=p["muted"], font=("TkDefaultFont", 8))
+
+
+# ============================ Updates: GitHub Releases ============================
+UPDATE_API = "https://api.github.com/repos/alter-xsource404/OpenDM-final-release/releases/latest"
+UPDATE_PAGE = "https://github.com/alter-xsource404/OpenDM-final-release/releases/latest"
+UPDATE_HOSTS = ("github.com", "githubusercontent.com")  # an update is only ever downloaded from GitHub (https), including its CDN redirect
+SETUP_WORDS = ("setup", "installer", "install")         # asset names containing one of these are the installer; the other .exe is the portable build
+SETUP_ARGS = ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CLOSEAPPLICATIONS"]  # Inno Setup: small progress window, no questions. /VERYSILENT hides even that.
+
+
+class UpdateError(Exception):
+    pass
+
+
+def parse_version(text):
+    """'v1.6.10' -> (1, 6, 10). Anything after the numbers ('-beta') is ignored. None when there are no digits."""
+    m = re.match(r"\s*[vV]?(\d+(?:\.\d+)*)", str(text or ""))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def is_newer(latest, current=None):
+    """True when `latest` is a higher version than `current` (1.6 == 1.6.0). Unreadable versions are never 'newer'."""
+    a, b = parse_version(latest), parse_version(current or __version__)
+    if not a or not b:
+        return False
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def install_kind(frozen=None, system=None, exe=None, listdir=os.listdir, env=None):
+    """'installed' (set up by the Inno installer), 'portable' (a lone .exe) or 'manual' (source / macOS / Linux: no automatic install).
+    The installer leaves its uninstaller (unins000.exe) next to OpenDM.exe; a portable copy has none. OPENDM_UPDATE_KIND forces a kind (testing)."""
+    env = os.environ if env is None else env
+    forced = (env.get("OPENDM_UPDATE_KIND") or "").strip().lower()
+    if forced in ("installed", "portable", "manual"):
+        return forced
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if not frozen or (system or platform.system()) != "Windows":
+        return "manual"
+    try:
+        names = [n.lower() for n in listdir(os.path.dirname(exe or sys.executable))]
+    except OSError:
+        names = []
+    return "installed" if any(re.fullmatch(r"unins\d+\.exe", n) for n in names) else "portable"
+
+
+def pick_asset(assets, kind):
+    """Choose the release file for this kind of install, by name: 'installed' -> the *setup* / *installer* .exe;
+    'portable' -> the *portable* .exe (or, failing that, any .exe that is not an installer). None when nothing fits."""
+    def name(a):
+        return str(a.get("name") or "").lower()
+    exes = [a for a in assets or [] if isinstance(a, dict) and name(a).endswith(".exe") and a.get("browser_download_url") and not name(a).startswith("unins")]
+    is_setup = lambda a: any(w in name(a) for w in SETUP_WORDS)
+    if kind == "installed":
+        pool = [a for a in exes if is_setup(a)]
+    elif kind == "portable":
+        pool = [a for a in exes if "portable" in name(a)] or [a for a in exes if not is_setup(a)]
+    else:
+        return None
+    pool.sort(key=lambda a: (not any(w in name(a) for w in ("win", "x64")), name(a)))
+    return pool[0] if pool else None
+
+
+def plain_notes(md, limit=6000):
+    """GitHub release notes are Markdown; the dialog shows them as plain text."""
+    out = []
+    for ln in str(md or "").replace("\r\n", "\n").split("\n"):
+        ln = re.sub(r"^\s{0,3}#{1,6}\s*", "", ln)
+        ln = re.sub(r"^(\s*)[-*+]\s+", lambda m: m.group(1) + "\u2022 ", ln)
+        ln = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", ln)
+        out.append(re.sub(r"(\*\*|__|`)", "", ln).rstrip())
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "\u2026"
+    return text or "No release notes were provided."
+
+
+def parse_release(data, current=None, kind=None):
+    """GitHub's 'latest release' JSON -> {version, notes, page, asset, kind, newer}. None for drafts / pre-releases."""
+    if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
+        return None
+    tag = str(data.get("tag_name") or data.get("name") or "").strip()
+    if not parse_version(tag):
+        raise UpdateError("The latest release has no version number in its tag.")
+    kind = kind or install_kind()
+    page = data.get("html_url") or UPDATE_PAGE
+    return {"version": ".".join(map(str, parse_version(tag))), "tag": tag, "notes": plain_notes(data.get("body")),
+            "page": page if trusted_update_url(page) else UPDATE_PAGE, "kind": kind,
+            "asset": pick_asset(data.get("assets"), kind), "newer": is_newer(tag, current)}
+
+
+def fetch_latest_release(opener=None, url=UPDATE_API, timeout=15):
+    """Asks GitHub for the latest release. Goes through OpenDM's own connection layer, so the proxy settings apply."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with (opener or OPENER).open(req, timeout=timeout) as r:
+            return json.loads(r.read(4_000_000).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise UpdateError({404: "No release has been published yet.", 403: "GitHub is limiting requests right now. Try again later."}.get(e.code, f"GitHub answered HTTP {e.code}."))
+    except (OSError, ValueError) as e:  # URLError, timeouts, bad JSON
+        raise UpdateError(f"Could not reach GitHub ({getattr(e, 'reason', e)}).")
+
+
+def check_for_update(opener=None, current=None, kind=None, url=UPDATE_API):
+    """Network call. Returns parse_release()'s dict (its 'newer' says whether to offer it); raises UpdateError."""
+    info = parse_release(fetch_latest_release(opener, url), current, kind)
+    if info is None:
+        raise UpdateError("The latest release is a draft or pre-release.")
+    return info
+
+
+def trusted_update_url(url):
+    p = urllib.parse.urlparse(str(url or ""))
+    host = (p.hostname or "").lower()
+    return p.scheme == "https" and any(host == h or host.endswith("." + h) for h in UPDATE_HOSTS)
+
+
+def folder_writable(folder):
+    try:
+        with tempfile.TemporaryFile(dir=folder):
+            return True
+    except OSError:
+        return False
+
+
+def download_update(asset, dest, progress=None, stop=None, opener=None, trusted=trusted_update_url):
+    """Downloads the release file to `dest` (through a .part file) and checks it: right host, right size, the SHA-256 GitHub lists
+    for the asset (when it lists one), and a Windows executable header. progress(done, total); set `stop` to cancel."""
+    url = str(asset.get("browser_download_url") or "")
+    if not trusted(url):
+        raise UpdateError("The update is not hosted on GitHub; refusing to download it.")
+    want_size, digest = int(asset.get("size") or 0), str(asset.get("digest") or "").lower()
+    part, h, done = dest + ".part", hashlib.sha256(), 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/octet-stream"})
+        with (opener or OPENER).open(req, timeout=30) as r, open(part, "wb") as f:
+            if not trusted(r.geturl()):
+                raise UpdateError("The download was redirected away from GitHub; refusing it.")
+            total = int(r.headers.get("Content-Length") or want_size or 0)
+            while True:
+                if stop is not None and stop.is_set():
+                    raise UpdateError("Cancelled.")
+                chunk = r.read(CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        if (want_size and done != want_size) or (total and done != total):
+            raise UpdateError(f"The download is incomplete ({done} of {total or want_size} bytes).")
+        if digest.startswith("sha256:") and h.hexdigest() != digest[7:]:
+            raise UpdateError("The download does not match GitHub's checksum; it was discarded.")
+        with open(part, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise UpdateError("The downloaded file is not a Windows program.")
+        os.replace(part, dest)
+        return dest
+    except UpdateError:
+        raise
+    except OSError as e:
+        raise UpdateError(f"Download failed: {getattr(e, 'reason', e)}")
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+
+def _bat(path):
+    return str(path).replace("%", "%%")  # a literal % in a path must be doubled inside a .bat file
+
+
+def portable_script(target, new):
+    """Batch file for the portable build. OpenDM has to be gone before its .exe can be overwritten, so it keeps retrying the swap
+    (up to ~90 s), then starts the new copy. If it never succeeds it removes the download and starts the old copy again."""
+    return "\r\n".join([
+        "@echo off", "chcp 65001 >nul", f'set "TARGET={_bat(target)}"', f'set "NEW={_bat(new)}"', "set /a TRIES=0", ":swap",
+        'move /y "%NEW%" "%TARGET%" >nul 2>&1', "if not errorlevel 1 goto done", "set /a TRIES+=1", "if %TRIES% GEQ 90 goto fail",
+        "ping -n 2 127.0.0.1 >nul", "goto swap", ":fail", 'del "%NEW%" >nul 2>&1', ":done", 'start "" "%TARGET%"',
+        '(goto) 2>nul & del "%~f0"', ""])
+
+
+def installer_script(setup, target, args=None):
+    """Batch file for the installed build: wait for OpenDM to exit, run the installer silently, delete it, start OpenDM again."""
+    return "\r\n".join([
+        "@echo off", "chcp 65001 >nul", f'set "SETUP={_bat(setup)}"', f'set "TARGET={_bat(target)}"', "ping -n 4 127.0.0.1 >nul",
+        'start "" /wait "%SETUP%" ' + " ".join(args or SETUP_ARGS), 'del "%SETUP%" >nul 2>&1', 'start "" "%TARGET%"', '(goto) 2>nul & del "%~f0"', ""])
+
+
+def launch_script(script, popen=subprocess.Popen):
+    """Runs a .bat in the background, without a console window, and independent of OpenDM (which is about to quit)."""
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # the new copy must unpack itself instead of reusing this one's temp folder
+    env.pop("_MEIPASS2", None)
+    popen(["cmd.exe", "/c", script], creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+          close_fds=True, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stage_path(kind, asset, exe=None):
+    """Where the update is downloaded to. Portable: next to the running .exe (so the final swap is one atomic rename on the same drive)."""
+    if kind == "portable":
+        exe = exe or sys.executable
+        if not folder_writable(os.path.dirname(exe)):
+            raise UpdateError("OpenDM's folder is write-protected, so it can't replace itself there.\nMove it to a normal folder, or download the new version by hand.")
+        return exe + ".new"
+    safe = re.sub(r"[^\w.\- ]", "_", os.path.basename(str(asset.get("name") or "OpenDM-Setup.exe")))
+    folder = os.path.join(tempfile.gettempdir(), "opendm-update")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, safe)
+
+
+def apply_update(kind, downloaded, exe=None, launcher=launch_script):
+    """Writes the helper script and starts it. The caller must quit OpenDM right afterwards."""
+    if not getattr(sys, "frozen", False) and exe is None:
+        raise UpdateError("Only the packaged .exe can update itself.")
+    exe = exe or sys.executable
+    text = portable_script(exe, downloaded) if kind == "portable" else installer_script(downloaded, exe)
+    script = os.path.join(tempfile.mkdtemp(prefix="opendm-update-"), "update.bat")
+    with open(script, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    launcher(script)
+    return script
 
 
 class App:
@@ -3423,7 +5259,7 @@ class App:
         self.mgr = Manager()
         st = self.mgr.settings
         self.root = root = tk.Tk()
-        root.title("OpenDM - Open Download Manager")
+        root.title(f"OpenDM {__version__} - Open Download Manager")
         root.geometry("1220x700")
         root.minsize(860, 480)
         try:  # window / taskbar icon (embedded, so it also works from a single-file build)
@@ -3436,7 +5272,13 @@ class App:
             self.style.theme_use("clam")
         self.style.configure("Treeview", rowheight=22)
         self.style.configure("Toolbutton", padding=(8, 4))
+        self._native_theme, self._themed, self._was_custom, self._mode_seen, self._mode_check = self.style.theme_use(), False, False, "light", 0.0
+        self.sounds, self.sound_seen = SoundPlayer(st, focused=self._has_focus), {}
+        self.sounds.fallback = root.bell  # no sound player or sound file on this machine: at least beep
+        self.apply_theme()
         self.icons = {k: tk.PhotoImage(data=v) for k, v in UI_ICONS.items()}
+        self.icons.update({g: glyph_image(g) for g in GLYPHS})
+        self.icons_small = {k: im.subsample(2) for k, im in self.icons.items() if k in TOOLBAR_ACTIONS}  # the 'small icons' toolbar option
         self.folder = tk.StringVar(value=st.get("folder") or os.path.join(os.path.expanduser("~"), "Downloads"))
         st["folder"] = self.folder.get()
         self.conns = tk.IntVar(value=int(st.get("connections") or 8))
@@ -3451,14 +5293,153 @@ class App:
         self.note, self._quiet = ("", 0), False
         self.captured, self.pending_urls, self.pwins = queue.Queue(), set(), {}  # links from the browser awaiting confirmation; open confirm dialogs; open progress windows
         for d in self.mgr.items:
-            d.announced = d.status == "Completed"  # only downloads that finish during this session pop up "Download complete"
+            d.announced = d._threat_told = d.status == "Completed"  # only downloads that finish during this session pop up "Download complete" (or a threat warning)
+        self.mgr.scanner_on = True  # finished downloads are checked by the installed antivirus (Options > Extras)
+        self.scan_watch = []  # downloads whose manual 'Scan for viruses' result is still to be shown
+        self.clips, self._clip_last, self._clip_check = ClipHistory(os.path.join(CFG_DIR, "clipboard.json")), None, 0.0
+        self.show_widget = tk.BooleanVar(value=bool(st.get("widget_on")))
+        self.widget = FloatingWidget(self)
         self.api_srv = start_api(self.mgr, lambda: (self.folder.get(), self.conns.get()), port, confirm=self._capture)
+        self.update_q, self.update_info, self._upd_busy, self._upd_pending, self._upd_win = queue.Queue(), None, False, False, None  # update check (GitHub Releases)
         self.build_menu()
         self.build_ui()
         self.build_context_menus()
         self.bind_keys()
         self.rebuild_side()
         root.protocol("WM_DELETE_WINDOW", self.request_close)
+
+    # ------------------------------------------------------------------ appearance
+    def _has_focus(self):
+        try:
+            return self.root.state() in ("normal", "zoomed") and self.root.focus_displayof() is not None
+        except tk.TclError:
+            return False
+
+    def apply_theme(self):
+        """Light / dark / follow-the-system, plus the accent colour. Safe to call at any time (Options calls it after OK)."""
+        st, s, root = self.mgr.settings, self.style, self.root
+        skin = str(st.get("skin") or "default").lower()
+        skin = skin if skin in SKINS else "default"
+        mode = SKINS[skin][0] if skin != "default" else resolve_mode(st.get("theme", "system"))  # a skin brings its own light / dark
+        p = make_palette(mode, valid_hex(st.get("accent")) or DEFAULT_ACCENT, skin)
+        set_palette(p)
+        self._mode_seen = mode
+        custom = mode == "dark" or p["accent"] != DEFAULT_ACCENT or skin != "default"
+        if not custom and platform.system() != "Linux":
+            s.theme_use(self._native_theme)  # the native Windows / macOS look is kept when nothing was changed
+            self._themed = False
+        elif custom or self._themed:
+            s.theme_use("clam")  # the only built-in theme that can be coloured everywhere
+            self._style_clam(p)
+            self._themed = True
+        s.configure("Treeview", rowheight=22)
+        s.configure("Toolbutton", padding=(8, 4))
+        if custom or self._themed or self._was_custom:
+            self._tk_defaults(p)
+            self._repaint(root)
+        self._was_custom = custom
+        set_dark_titlebar(root, mode == "dark")
+
+    def _style_clam(self, p):
+        s = self.style
+        s.configure(".", background=p["bg"], foreground=p["fg"], fieldbackground=p["field"], bordercolor=p["border"], darkcolor=p["border"],
+                    lightcolor=p["border"], troughcolor=p["panel"], focuscolor=p["accent"], insertcolor=p["fg"],
+                    selectbackground=p["accent"], selectforeground=p["accent_fg"])
+        s.map(".", foreground=[("disabled", p["muted"])])
+        for name in ("TButton", "TMenubutton"):
+            s.configure(name, background=p["button"], foreground=p["fg"])
+            s.map(name, background=[("pressed", p["accent"]), ("active", p["button_active"]), ("disabled", p["bg"])],
+                  foreground=[("pressed", p["accent_fg"]), ("disabled", p["muted"])])
+        s.configure("Toolbutton", background=p["bg"], foreground=p["fg"])
+        s.map("Toolbutton", background=[("pressed", p["accent"]), ("active", p["button_active"])], foreground=[("disabled", p["muted"])])
+        for name in ("TCheckbutton", "TRadiobutton"):
+            s.configure(name, background=p["bg"], indicatorcolor=p["field"])
+            s.map(name, background=[("active", p["bg"])], indicatorcolor=[("selected", p["accent"]), ("pressed", p["accent"])])
+        for name in ("TEntry", "TCombobox", "TSpinbox"):
+            s.configure(name, fieldbackground=p["field"], foreground=p["fg"], insertcolor=p["fg"], bordercolor=p["border"])
+            s.map(name, fieldbackground=[("readonly", p["panel"]), ("disabled", p["bg"])], foreground=[("disabled", p["muted"])])
+        for name in ("TCombobox", "TSpinbox"):
+            s.configure(name, arrowcolor=p["fg"], background=p["button"])
+        s.configure("TNotebook", background=p["bg"], bordercolor=p["border"])
+        s.configure("TNotebook.Tab", background=p["panel"], foreground=p["fg"], padding=(10, 4))
+        s.map("TNotebook.Tab", background=[("selected", p["bg"])], foreground=[("selected", p["fg"])])
+        s.configure("Treeview", background=p["field"], fieldbackground=p["field"], foreground=p["fg"])
+        s.map("Treeview", background=[("selected", p["accent"])], foreground=[("selected", p["accent_fg"])])
+        s.configure("Treeview.Heading", background=p["button"], foreground=p["fg"], relief="flat")
+        s.map("Treeview.Heading", background=[("active", p["button_active"])])
+        s.configure("TScrollbar", background=p["button"], troughcolor=p["panel"], arrowcolor=p["fg"])
+        s.map("TScrollbar", background=[("active", p["button_active"])])
+        s.configure("Horizontal.TProgressbar", background=p["accent"], troughcolor=p["panel"])
+        s.configure("TSeparator", background=p["border"])
+        s.configure("TPanedwindow", background=p["bg"])
+        s.configure("TLabelframe", background=p["bg"])
+        s.configure("TLabelframe.Label", background=p["bg"], foreground=p["fg"])
+
+    def _tk_defaults(self, p):
+        """Colours for the classic (non-ttk) widgets that dialogs create later: windows, text boxes, menus, drop-down lists."""
+        for pat, val in (("*Toplevel.background", p["bg"]), ("*Text.background", p["field"]), ("*Text.foreground", p["fg"]),
+                         ("*Text.insertBackground", p["fg"]), ("*Text.selectBackground", p["accent"]), ("*Text.selectForeground", p["accent_fg"]),
+                         ("*Listbox.background", p["field"]), ("*Listbox.foreground", p["fg"]), ("*Listbox.selectBackground", p["accent"]),
+                         ("*Listbox.selectForeground", p["accent_fg"]), ("*Menu.background", p["panel"]), ("*Menu.foreground", p["fg"]),
+                         ("*Menu.activeBackground", p["accent"]), ("*Menu.activeForeground", p["accent_fg"]), ("*Canvas.background", p["graph_bg"])):
+            self.root.option_add(pat, val)
+
+    def _repaint(self, w):
+        """Recolour widgets that already exist (the ttk ones follow the style by themselves)."""
+        p, cls = PAL, w.winfo_class()
+        try:
+            if w is getattr(self, "gcv", None):
+                w.configure(bg=p["graph_bg"], highlightbackground=p["border"])
+            elif w is getattr(self, "mapcv", None):
+                w.configure(bg=p["map_bg"])
+            elif cls in ("Tk", "Toplevel"):
+                w.configure(bg=p["bg"])
+            elif cls == "Canvas":
+                w.configure(bg=p["graph_bg"])
+            elif cls in ("Text", "Listbox"):
+                w.configure(bg=p["field"], fg=p["fg"], selectbackground=p["accent"], selectforeground=p["accent_fg"])
+                if cls == "Text":
+                    w.configure(insertbackground=p["fg"])
+            elif cls == "Menu":
+                w.configure(bg=p["panel"], fg=p["fg"], activebackground=p["accent"], activeforeground=p["accent_fg"], disabledforeground=p["muted"])
+        except tk.TclError:
+            pass
+        for c in w.winfo_children():
+            self._repaint(c)
+
+    def follow_system_theme(self):
+        if self.mgr.settings.get("theme", "system") == "system" and self.mgr.settings.get("skin", "default") == "default" and time.time() - self._mode_check > 30:
+            self._mode_check = time.time()
+            if resolve_mode("system") != self._mode_seen:
+                self.apply_theme()
+
+    # ------------------------------------------------------------------ sounds
+    def collect_sounds(self, queue_finished):
+        """Work out what just happened (finished / failed / queue done) and let the SoundPlayer pick one sound for it."""
+        ev = {"all_done"} if queue_finished else set()
+        for d in self.mgr.items:
+            key = (d.status, d.verified, d.scan)
+            prev, self.sound_seen[id(d)] = self.sound_seen.get(id(d)), key
+            if prev is None or prev == key:
+                continue
+            if d.status == "Completed" and d.scan == "infected" and prev[2] != "infected":
+                ev.add("error")
+            if d.status == "Completed":
+                if d.checksum:  # with a checksum the result is known only after the hash check
+                    if d.verified == "ok" and prev[1] != "ok":
+                        ev.add("complete")
+                    elif d.verified in ("bad", "missing") and prev[1] != d.verified:
+                        ev.add("error")
+                elif prev[0] != "Completed":
+                    ev.add("complete")
+            elif d.status == "Error" and prev[0] != "Error" and not self.mgr.will_retry(d):  # a failure that is about to be retried stays quiet
+                ev.add("error")
+        if ev:
+            self.sounds.flush(ev)
+
+    def test_sound(self, event, custom=""):
+        if not run_sound(sound_plan(event, custom=custom)):
+            self.root.bell()
 
     # ------------------------------------------------------------------ small helpers
     def _on_limit(self, *_):
@@ -3496,6 +5477,7 @@ class App:
         tasks = menu("Tasks")
         item(tasks, "Add new download...", self.add_dialog, "Ctrl+N")
         item(tasks, "Add batch download from clipboard", self.add_from_clipboard)
+        item(tasks, "Clipboard history...", self.clipboard_dialog)
         item(tasks, "Run site grabber...", self.grabber_dialog)
         tasks.add_separator()
         item(tasks, "Export download list...", self.export_list)
@@ -3508,6 +5490,8 @@ class App:
         item(f, "Open folder", self.open_folder, None, "sel")
         item(f, "Move/Rename...", self.rename_file, "F2", "done1")
         item(f, "Redownload", self.redownload, None, "sel")
+        item(f, "Verify checksum / hashes...", self.hashes_selected, None, "done1")
+        item(f, "Scan for viruses", self.scan_selected, None, "done")
         f.add_separator()
         item(f, "Properties...", self.properties_dialog, "Alt+Enter", "sel1")
         item(f, "Copy address", self.copy_address, "Ctrl+C", "sel")
@@ -3543,6 +5527,9 @@ class App:
                                 ("Speed graph", self.show_graph, self.apply_layout), ("Status bar", self.show_status, self.apply_layout)):
             v.add_checkbutton(label=label, variable=var, command=cmd)
         v.add_separator()
+        v.add_checkbutton(label="Floating widget", variable=self.show_widget, command=lambda: self.toggle_widget(self.show_widget.get()))
+        item(v, "Customize toolbar...", self.customize_toolbar)
+        v.add_separator()
         sortm = tk.Menu(v, tearoff=0)
         for key, title, _ in COLUMNS:
             sortm.add_command(label=title, command=lambda k=key: self.sort_by(k, toggle=False))
@@ -3555,6 +5542,7 @@ class App:
         item(h, "Quick help", self.help_dialog)
         item(h, "Browser extension setup...", self.pairing_dialog)
         item(h, "Keyboard shortcuts", self.shortcuts_dialog)
+        item(h, "Check for updates...", lambda: self.start_update_check(manual=True))
         h.add_separator()
         item(h, "About OpenDM", self.about_dialog)
 
@@ -3571,14 +5559,7 @@ class App:
         self.toolbar = ttk.Frame(root, padding=(4, 3))
         self.toolbar.grid(row=0, column=0, sticky="ew")
         self.tbtn = {}
-        for entry in TOOLBAR:
-            if entry is None:
-                ttk.Separator(self.toolbar, orient="vertical").pack(side="left", fill="y", padx=5, pady=3)
-                continue
-            icon, label, meth = entry
-            b = ttk.Button(self.toolbar, text=label, image=self.icons[icon], compound="top", style="Toolbutton", command=getattr(self, meth))
-            b.pack(side="left", padx=1)
-            self.tbtn[icon] = b
+        self.rebuild_toolbar()
         # navigation tree (left) + download list (right) in a resizable split
         self.body = ttk.PanedWindow(root, orient="horizontal")
         self.body.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 2))
@@ -3605,9 +5586,9 @@ class App:
         self.gframe.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 0))
         self.gtitle = ttk.Label(self.gframe, text="", anchor="w")
         self.gtitle.pack(fill="x")
-        self.gcv = tk.Canvas(self.gframe, height=110, bg="white", highlightthickness=1, highlightbackground="#d1d5db")
+        self.gcv = tk.Canvas(self.gframe, height=110, bg=PAL["graph_bg"], highlightthickness=1, highlightbackground=PAL["border"])
         self.gcv.pack(fill="x")
-        self.mapcv = tk.Canvas(self.gframe, height=16, bg="#f3f4f6", highlightthickness=0)
+        self.mapcv = tk.Canvas(self.gframe, height=16, bg=PAL["map_bg"], highlightthickness=0)
         self.mapcv.pack(fill="x", pady=(4, 0))
         # status bar
         self.status = ttk.Label(root, text="", anchor="w", relief="sunken", padding=(6, 2))
@@ -3730,8 +5711,9 @@ class App:
 
     def update_state(self):
         fl = self.flags()
-        for icon, rule in (("resume", "resumable"), ("stop", "active"), ("stopall", "anyactive"), ("delete", "sel"), ("delc", "anydone")):
-            self.tbtn[icon].state(["!disabled"] if fl[rule] else ["disabled"])
+        for icon, rule in (("resume", "resumable"), ("stop", "active"), ("stopall", "anyactive"), ("delete", "sel"), ("delc", "anydone"), ("scan", "done")):
+            if icon in self.tbtn:  # the user may have taken the button off the toolbar
+                self.tbtn[icon].state(["!disabled"] if fl[rule] else ["disabled"])
         for m, idx, rule in self.menu_rules:
             m.entryconfig(idx, state="normal" if fl[rule] else "disabled")
 
@@ -3753,7 +5735,7 @@ class App:
     def build_context_menus(self):
         self.ctx = ctx = tk.Menu(self.root, tearoff=0)
         self.ctx_rules = {"Open": "done", "Open folder": "sel", "Resume": "resumable", "Stop": "active", "Delete": "sel", "Move to category": "sel",
-                          "Move to queue": "sel", "Limit speed...": "sel", "Redownload": "sel", "Properties...": "sel1", "Copy address": "sel"}
+                          "Move to queue": "sel", "Limit speed...": "sel", "Redownload": "sel", "Properties...": "sel1", "Copy address": "sel", "Hashes...": "done1"}
         ctx.add_command(label="Open", command=self.open_file)
         ctx.add_command(label="Open folder", command=self.open_folder)
         ctx.add_separator()
@@ -3768,6 +5750,7 @@ class App:
         ctx.add_separator()
         ctx.add_command(label="Limit speed...", command=self.limit_selected)
         ctx.add_command(label="Redownload", command=self.redownload)
+        ctx.add_command(label="Hashes...", command=self.hashes_selected)
         ctx.add_command(label="Properties...", command=self.properties_dialog)
         ctx.add_command(label="Copy address", command=self.copy_address)
         for ev in ("<Button-3>", "<Button-2>"):  # Button-2 is the right button on macOS
@@ -4032,6 +6015,60 @@ class App:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(d.url for d in sel))
 
+    def hashes_selected(self):
+        sel = self.selected()
+        if len(sel) == 1:
+            self.hashes_dialog(sel[0])
+
+    def hashes_dialog(self, d):
+        """MD5 / SHA-1 / SHA-256 / SHA-512 of a finished file, worked out in the background, with a box to compare a published value against."""
+        if not d.path or not os.path.isfile(d.path):
+            return self.info("File hashes", "The file isn't on disk (yet).")
+        win = tk.Toplevel(self.root)
+        win.title("File hashes")
+        win.transient(self.root)
+        ttk.Label(win, text=os.path.basename(d.path), font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 6))
+        vals = {a: tk.StringVar(value="calculating...") for a in HASH_ALGOS}
+        for r, a in enumerate(HASH_ALGOS, 1):
+            ttk.Label(win, text={"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256", "sha512": "SHA-512"}[a] + ":").grid(row=r, column=0, sticky="e", padx=(14, 6), pady=3)
+            e = ttk.Entry(win, textvariable=vals[a], width=72)
+            e.state(["readonly"])
+            e.grid(row=r, column=1, pady=3)
+            ttk.Button(win, text="Copy", command=lambda a=a: (self.root.clipboard_clear(), self.root.clipboard_append(vals[a].get()))).grid(row=r, column=2, padx=(6, 14))
+        ttk.Label(win, text="Compare with:").grid(row=5, column=0, sticky="e", padx=(14, 6), pady=(10, 3))
+        want = tk.StringVar()
+        ttk.Entry(win, textvariable=want, width=72).grid(row=5, column=1, pady=(10, 3))
+        verdict = ttk.Label(win, text="")
+        verdict.grid(row=6, column=1, sticky="w")
+        stop, res = threading.Event(), {}
+        threading.Thread(target=lambda: res.update(h=hash_file_multi(d.path, stop=stop)), daemon=True).start()
+
+        def judge(*_):
+            t = want.get().strip()
+            cs = parse_checksum(t)
+            if not t:
+                return verdict.config(text="")
+            if not cs:
+                return verdict.config(text="That isn't an MD5, SHA-1, SHA-256 or SHA-512 value.", foreground="#dc2626")
+            if not res.get("h"):
+                return verdict.config(text="Still calculating...", foreground="#6b7280")
+            same = res["h"].get(cs[0]) == cs[1]
+            verdict.config(text="MATCH - the file is intact." if same else "DOES NOT MATCH - the file differs from that value.", foreground="#16a34a" if same else "#dc2626")
+        want.trace_add("write", judge)
+
+        def poll():
+            if not win.winfo_exists():
+                return
+            if "h" in res:
+                for a in HASH_ALGOS:
+                    vals[a].set(res["h"].get(a, ""))
+                judge()
+            else:
+                win.after(150, poll)
+        poll()
+        win.bind("<Destroy>", lambda e: stop.set() if e.widget is win else None)
+        ttk.Button(win, text="Close", command=win.destroy).grid(row=7, column=0, columnspan=3, pady=12)
+
     def properties_dialog(self):
         sel = self.selected()
         if len(sel) != 1:
@@ -4051,10 +6088,29 @@ class App:
             e.grid(row=r, column=1, padx=(0, 14), pady=3)
         ttk.Label(win, text="Description:").grid(row=len(rows), column=0, sticky="e", padx=(14, 6), pady=3)
         desc = tk.StringVar(value=d.desc)
-        ttk.Entry(win, textvariable=desc, width=70).grid(row=len(rows), column=1, padx=(0, 14), pady=3)
+        ttk.Label(win, text="Expected hash:").grid(row=len(rows) + 1, column=0, sticky="e", padx=(14, 6), pady=3)
+        hv = tk.StringVar(value=d.checksum)
+        hrow = ttk.Frame(win)
+        hrow.grid(row=len(rows) + 1, column=1, sticky="w", pady=3)
+        ttk.Entry(hrow, textvariable=hv, width=58).pack(side="left")
+        ttk.Button(hrow, text="Hashes...", command=lambda: self.hashes_dialog(d)).pack(side="left", padx=(6, 0))
+        verdict = {"ok": "matched", "bad": "DID NOT MATCH", "missing": "could not be checked (file missing)"}.get(d.verified, "")
+        ttk.Label(win, foreground="#6b7280", text="MD5, SHA-1, SHA-256 or SHA-512. Checked automatically when the download finishes"
+                  + (f" - the last check {verdict}." if verdict else ".")).grid(row=len(rows) + 2, column=1, sticky="w")
+        ttk.Entry(win, textvariable=desc, width=70).grid(row=len(rows), column=1, padx=(0, 14), pady=3)  # created last: it is the dialog's last text box
+
+        def ok():
+            try:
+                cs = normalize_checksum(hv.get())
+            except ValueError:
+                return messagebox.showerror("Checksum", "That isn't an MD5, SHA-1, SHA-256 or SHA-512 value.", parent=win)
+            d.desc = desc.get().strip()
+            d.set_checksum(cs)
+            win.destroy()
+            self.draw_list()
         row = ttk.Frame(win)
-        row.grid(row=len(rows) + 1, column=0, columnspan=2, pady=12)
-        ttk.Button(row, text="OK", command=lambda: (setattr(d, "desc", desc.get().strip()), win.destroy(), self.draw_list())).pack(side="left", padx=6)
+        row.grid(row=len(rows) + 3, column=0, columnspan=2, pady=12)
+        ttk.Button(row, text="OK", command=ok).pack(side="left", padx=6)
         ttk.Button(row, text="Cancel", command=win.destroy).pack(side="left", padx=6)
 
     # ------------------------------------------------------------------ IDM-style windows: confirm, progress, complete
@@ -4086,6 +6142,8 @@ class App:
         if job["url"] in seen or job["url"] in self.pending_urls:  # the browser sometimes sends a link twice
             return
         seen[job["url"]] = now
+        if self.mgr.settings.get("dup_links", "ask") == "skip" and self.mgr.find_duplicate(job["url"]):
+            return  # Configuration > Downloads: links already in the list are ignored
         if self.mgr.settings.get("confirm_captured", True):
             if self.captured.qsize() >= CAPTURE_MAX_QUEUE:  # a page spraying links: don't bury the user in windows
                 return
@@ -4103,7 +6161,43 @@ class App:
                 return
             if time.time() - job.get("_t", time.time()) > CAPTURE_EXPIRE_SECS:
                 continue
+            if not self.dup_ok(job["url"]):
+                continue
             self.confirm_dialog(job)
+
+    def dup_ok(self, url):
+        """Configuration > Downloads > duplicate links: ask / skip / add anyway. True = go ahead and add."""
+        mode = self.mgr.settings.get("dup_links", "ask")
+        dup = None if mode == "add" else self.mgr.find_duplicate(url)
+        if dup is None:
+            return True
+        if mode == "skip":
+            self.flash(f"Already in the list: {dup.label}")
+            return False
+        return bool(messagebox.askyesno("Duplicate link", f"This link is already in the list:\n{dup.label} ({dup.status})\n\nAdd it again?", parent=self.root))
+
+    def poll_clipboard(self):
+        """Configuration > General > 'Automatically start downloading URLs placed to clipboard' (still asks first if the confirm option is on)."""
+        st = self.mgr.settings
+        if not st.get("clip_monitor"):
+            self._autoclip_last = None
+            return
+        now = time.time()
+        if now - getattr(self, "_autoclip_t", 0) < 1:
+            return
+        self._autoclip_t = now
+        try:
+            text = self.root.clipboard_get().strip()
+        except tk.TclError:
+            return
+        first = getattr(self, "_autoclip_last", None) is None  # the first look only remembers what is already there
+        if text == getattr(self, "_autoclip_last", None):
+            return
+        self._autoclip_last = text
+        if first or "\n" in text or not text.lower().startswith(("http://", "https://")):
+            return
+        if url_ext(text) in split_list(st.get("capture_types")) and capture_decision(st, text):
+            self._capture({"url": text, "folder": self.folder.get(), "connections": self.conns.get(), "kind": None, "kw": {}})
 
     def confirm_dialog(self, job):
         """'Download File Info': a captured link only starts when the user clicks Start Download."""
@@ -4219,7 +6313,7 @@ class App:
             lab[k].grid(row=r, column=1, sticky="w", pady=1)
         bar = ttk.Progressbar(t1, maximum=100)
         bar.pack(fill="x", pady=(8, 4))
-        cv = tk.Canvas(t1, height=14, highlightthickness=0, background="white")
+        cv = tk.Canvas(t1, height=14, highlightthickness=0, background=PAL["graph_bg"])
         cv.pack(fill="x", pady=(0, 6))
         details = ttk.Frame(t1)
         details.pack(fill="both", expand=True)
@@ -4326,9 +6420,9 @@ class App:
             cv.delete("all")
             W, H = max(cv.winfo_width(), 100), max(cv.winfo_height(), 10)
             for x0, x1, xf in d.segment_map():
-                cv.create_rectangle(x0 * W, 1, x1 * W, H - 1, fill="#e5e7eb", outline="#9ca3af")
+                cv.create_rectangle(x0 * W, 1, x1 * W, H - 1, fill=PAL["seg_empty"], outline=PAL["seg_border"])
                 if xf > x0:
-                    cv.create_rectangle(x0 * W, 1, xf * W, H - 1, fill="#2563eb", outline="")
+                    cv.create_rectangle(x0 * W, 1, xf * W, H - 1, fill=PAL["accent"], outline="")
             rows = d.segment_rows()
             if rows != cache["rows"]:
                 cache["rows"] = rows
@@ -4356,11 +6450,17 @@ class App:
         for d in list(self.mgr.items):
             if d.status != "Completed" or d.announced:
                 continue
-            d.announced = True
+            if d.checksum and not d.verified:
+                continue  # the hash check is still running: announce the download with its verdict
+            if d._scanning and time.time() - d._scan_t0 < 8:
+                continue  # a quick virus scan gets a moment, so the dialog can show its verdict (a slow one updates the open dialog)
+            d.announced, d._scan_shown = True, bool(d.scan)
+            if d.verified == "bad" and self.tray and self.mgr.settings.get("notify", True):
+                self.tray.notify(f"Checksum does NOT match: {d.label}")
             w = self.pwins.pop(id(d), None)
             if w and w["win"].winfo_exists():
                 w["win"].destroy()
-            if d.open_when_done and d.path and os.path.exists(d.path):
+            if d.open_when_done and d.path and os.path.exists(d.path) and d.scan != "infected":  # never auto-open a file the antivirus flagged
                 self.open_path(d.path)
             show = self.mgr.settings.get("show_complete_dialog", True) if d.show_complete is None else d.show_complete
             if show:
@@ -4419,6 +6519,32 @@ class App:
             e.insert(0, v)
             e.state(["readonly"])
             e.grid(row=r, column=1, sticky="we", pady=3)
+        if d.verified in ("ok", "bad", "missing"):
+            algo = d.checksum.split(":")[0].upper()
+            msg, col = {"ok": (f"{algo} checksum verified - the file is intact.", "#16a34a"),
+                        "bad": (f"WARNING: the {algo} checksum does NOT match.\nExpected  {d.checksum.split(':')[1]}\nThe file   {d.actual_hash}\n"
+                                "The file may be damaged or have been tampered with.", "#dc2626"),
+                        "missing": ("The checksum couldn't be checked: the file is gone.", "#dc2626")}[d.verified]
+            ttk.Label(win, text=msg, foreground=col, wraplength=560, justify="left").pack(anchor="w", padx=14, pady=(2, 0))
+        scan_lbl = ttk.Label(win, text="", wraplength=560, justify="left")
+        scan_lbl.pack(anchor="w", padx=14, pady=(2, 0))
+
+        def show_scan():  # the antivirus verdict; it keeps updating while a slow scan is still running
+            try:
+                if not win.winfo_exists():
+                    return
+                if d._scanning:
+                    scan_lbl.config(text="Scanning for viruses...", foreground=PAL["muted"])
+                    win.after(500, show_scan)
+                    return
+                if d.scan_info:
+                    scan_lbl.config(text=d.scan_info + ("\nDon't open this file unless you are sure it is safe." if d.scan == "infected" else ""),
+                                    foreground={"clean": "#16a34a", "infected": "#dc2626", "error": "#d97706"}.get(d.scan, PAL["muted"]))
+                else:
+                    scan_lbl.pack_forget()
+            except tk.TclError:
+                pass
+        show_scan()
         never = tk.BooleanVar(value=False)
 
         def finish():
@@ -4433,9 +6559,17 @@ class App:
                 return True
             messagebox.showerror("OpenDM", "The file is no longer there.", parent=win)
             return False
+
+        def open_it():
+            if not need_file():
+                return
+            if d.scan == "infected" and not messagebox.askyesno("OpenDM", f"The antivirus reported:\n{d.scan_info}\n\nOpen the file anyway?", icon="warning", default="no", parent=win):
+                return
+            self.open_path(path)
+            finish()
         row = ttk.Frame(win)
         row.pack(pady=(8, 4))
-        for text, fn in (("Open", lambda: need_file() and (self.open_path(path), finish())),
+        for text, fn in (("Open", open_it),
                          ("Open with...", lambda: need_file() and (self.open_with(path, win), finish())),
                          ("Open folder", lambda: need_file() and (self.reveal(path), finish())),
                          ("Close", finish)):
@@ -4454,7 +6588,7 @@ class App:
         txt.pack(padx=14)
         try:
             clip = self.root.clipboard_get().strip()
-            if clip.lower().startswith(("http://", "https://")):
+            if clip.lower().startswith(URL_SCHEMES):
                 txt.insert("1.0", clip)
         except tk.TclError:
             pass
@@ -4466,14 +6600,27 @@ class App:
         ttk.Label(row, text="Queue:").pack(side="left")
         ttk.Combobox(row, textvariable=que, state="readonly", width=22, values=self.mgr.settings["queues"]).pack(side="left", padx=4)
         ttk.Label(win, text="Save to: " + self.folder.get(), foreground="#6b7280").pack(anchor="w", padx=14)
+        hv = tk.StringVar()
+        hr = ttk.Frame(win)
+        hr.pack(fill="x", padx=14, pady=(8, 0))
+        ttk.Label(hr, text="Checksum (optional, for a single address):").pack(side="left")
+        ttk.Entry(hr, textvariable=hv, width=46).pack(side="left", padx=6)
 
         def go(later):
-            urls = [x.strip() for x in txt.get("1.0", "end").splitlines() if x.strip().lower().startswith(("http://", "https://"))]
+            urls = [x.strip() for x in txt.get("1.0", "end").splitlines() if x.strip().lower().startswith(URL_SCHEMES)]
             if not urls:
-                return self.info("Add URL", "Paste at least one http:// or https:// address.", win)
+                return self.info("Add URL", "Paste at least one http://, https:// or ftp:// address.", win)
+            if self.mgr.settings.get("smart_unwrap", True):
+                urls = [unwrap_url(u)[0] for u in urls]  # google.com/url?q=..., facebook l.php?u=... : the real address, no network needed
+            try:
+                cs = normalize_checksum(hv.get())
+            except ValueError:
+                return self.info("Add URL", "That checksum isn't an MD5, SHA-1, SHA-256 or SHA-512 value.", win)
+            if cs and len(urls) != 1:
+                return self.info("Add URL", "A checksum belongs to one file: enter a single address.", win)
             added = []
             for u in urls:
-                d = self.mgr.add(u, self.folder.get(), self.conns.get(), queue=que.get(), later=later)
+                d = self.mgr.add(u, self.folder.get(), self.conns.get(), queue=que.get(), later=later, **({"checksum": cs} if cs else {}))
                 if cat.get() != "Automatic":
                     self.mgr.move_to_category(d, cat.get())
                 added.append(d)
@@ -4482,10 +6629,13 @@ class App:
             if not later:
                 for d in added[:3]:  # a window per download, but not a screenful for a big batch
                     self.progress_window(d)
+        note = ttk.Label(win, text="", wraplength=620, justify="left", foreground="#6b7280")
+        note.pack(anchor="w", padx=14, pady=(6, 0))
         btns = ttk.Frame(win)
         btns.pack(pady=(10, 14))
         ttk.Button(btns, text="Start Download", command=lambda: go(False)).pack(side="left", padx=6)
         ttk.Button(btns, text="Download Later", command=lambda: go(True)).pack(side="left", padx=6)
+        ttk.Button(btns, text="Resolve link...", command=lambda: self.resolve_in_dialog(win, txt, note)).pack(side="left", padx=6)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left", padx=6)
         txt.focus_set()
 
@@ -4494,9 +6644,9 @@ class App:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
-        urls = list(dict.fromkeys(re.findall(r"https?://[^\s<>\"']+", text)))
+        urls = list(dict.fromkeys(re.findall(r"(?:https?|ftps?)://[^\s<>\"']+", text)))
         if not urls:
-            return self.info("Batch download", "The clipboard doesn't contain any http:// or https:// links.")
+            return self.info("Batch download", "The clipboard doesn't contain any http://, https:// or ftp:// links.")
         if messagebox.askyesno("Batch download", f"Download {len(urls)} link(s) from the clipboard?", parent=self.root):
             for u in urls:
                 self.mgr.add(u, self.folder.get(), self.conns.get(), queue=self.cur_queue())
@@ -4649,6 +6799,36 @@ class App:
         maxa, limit = tk.IntVar(value=self.mgr.max_active), tk.IntVar(value=self.limit_var.get())
         quality = tk.StringVar(value=str(st.get("quality") or "Best"))
 
+        def group(parent, title):
+            g = ttk.LabelFrame(parent, text=title, padding=8)
+            g.pack(fill="x", pady=(0, 8))
+            return g
+
+        def textbox(parent, value, height):
+            t = tk.Text(parent, width=70, height=height, wrap="word")
+            t.insert("1.0", value)
+            t.pack(anchor="w", pady=(2, 6))
+            return t
+
+        def read(t):
+            return t.get("1.0", "end").strip()
+
+        def choice(parent, key, options, default, label=None, width=46):
+            """Dropdown with friendly labels; returns a getter for the stored value."""
+            cur = st.get(key, default)
+            var = tk.StringVar(value=options.get(cur, options[default]))
+            if label:
+                ttk.Label(parent, text=label).pack(anchor="w")
+            ttk.Combobox(parent, textvariable=var, state="readonly", width=width, values=list(options.values())).pack(anchor="w", pady=(2, 8))
+            return lambda: next((k for k, t in options.items() if t == var.get()), default)
+
+        def folder_row(parent, label, var):
+            ttk.Label(parent, text=label).pack(anchor="w")
+            fr = ttk.Frame(parent)
+            fr.pack(anchor="w", pady=(2, 8))
+            ttk.Entry(fr, textvariable=var, width=58).pack(side="left")
+            ttk.Button(fr, text="Browse...", command=lambda: var.set(filedialog.askdirectory(parent=win, initialdir=var.get() or None) or var.get())).pack(side="left", padx=6)
+
         gen = ttk.Frame(nb, padding=14)
         nb.add(gen, text="General")
         for key, text in (("tray", "Show an icon in the system tray"), ("close_to_tray", "Closing the window keeps OpenDM running in the tray"),
@@ -4656,6 +6836,11 @@ class App:
                           ("show_complete_dialog", "Show the \"Download complete\" dialog when a download finishes"),
                           ("confirm_captured", "Ask before starting links sent from the browser")):
             ttk.Checkbutton(gen, text=text, variable=v[key]).pack(anchor="w", pady=3)
+        gv = {k: tk.BooleanVar(value=bool(st.get(k, False))) for k in ("autostart", "clip_monitor")}
+        gv["check_updates"] = tk.BooleanVar(value=bool(st.get("check_updates", True)))
+        ttk.Checkbutton(gen, text="Launch OpenDM when I sign in to the computer", variable=gv["autostart"]).pack(anchor="w", pady=3)
+        ttk.Checkbutton(gen, text="Check for a new version of OpenDM when it starts (GitHub)", variable=gv["check_updates"]).pack(anchor="w", pady=3)
+        ttk.Checkbutton(gen, text="Automatically start downloading URLs placed on the clipboard (links to files only)", variable=gv["clip_monitor"]).pack(anchor="w", pady=3)
         ttk.Label(gen, wraplength=420, justify="left", foreground="#6b7280",
                   text="The tray icon needs the optional add-on:  pip install pystray pillow  (Windows and Linux; not macOS).").pack(anchor="w", pady=(10, 0))
 
@@ -4668,6 +6853,11 @@ class App:
         ttk.Button(fr, text="Browse...", command=lambda: folder.set(filedialog.askdirectory(parent=win, initialdir=folder.get()) or folder.get())).pack(side="left", padx=6)
         ttk.Checkbutton(sv, text="Save each download in its category's folder (Video, Documents, ...)", variable=v["auto_sort"]).pack(anchor="w", pady=3)
         ttk.Button(sv, text="Edit categories...", command=self.categories_dialog).pack(anchor="w", pady=10)
+        temp = tk.StringVar(value=str(st.get("temp_folder") or ""))
+        folder_row(sv, "Temporary folder for streaming (HLS) downloads - empty = next to the file:", temp)
+        dup_get = choice(sv, "dup_links", {"ask": "Ask me", "skip": "Ignore the new link", "add": "Add it again"}, "ask", label="If a link is already in the list:")
+        exist_get = choice(sv, "file_exists", {"rename": "Add a number to the new file's name", "overwrite": "Replace the existing file"}, "rename",
+                           label="If a file with the same name is already in the folder:")
 
         cn = ttk.Frame(nb, padding=14)
         nb.add(cn, text="Connection")
@@ -4688,6 +6878,256 @@ class App:
         e.state(["readonly"])
         e.pack(anchor="w", pady=8)
         ttk.Button(br, text="Copy token", command=lambda: (self.root.clipboard_clear(), self.root.clipboard_append(get_token()))).pack(anchor="w")
+        ttk.Button(br, text="Browser integration setup...", command=self.pairing_dialog).pack(anchor="w", pady=8)
+
+        # ---- browser capture rules (the extension reads these from OpenDM)
+        cap = ttk.Frame(nb, padding=12)
+        nb.add(cap, text="Capture")
+        cl, cr = ttk.Frame(cap), ttk.Frame(cap)   # two columns so the tab stays short on small screens
+        cl.pack(side="left", fill="y", anchor="n", padx=(0, 12))
+        cr.pack(side="left", fill="y", anchor="n")
+        cv = {k: tk.BooleanVar(value=bool(st.get(k, True))) for k in ("capture_downloads", "ctx_link", "ctx_media", "video_button")}
+        g = group(cl, "Browser integration")
+        ttk.Checkbutton(g, text="Capture downloads from browsers", variable=cv["capture_downloads"]).pack(anchor="w", pady=2)
+        br_vars, cur_br = {}, (st.get("capture_browsers") if isinstance(st.get("capture_browsers"), dict) else {})
+        g = group(cl, "Capture downloads from the following browsers")
+        for key, label in BROWSER_NAMES:
+            br_vars[key] = tk.BooleanVar(value=bool(cur_br.get(key, True)))
+            ttk.Checkbutton(g, text=label, variable=br_vars[key]).pack(anchor="w", pady=2)
+        g = group(cr, "Keys to prevent or force downloading with OpenDM")
+        key_labels = {"none": "None", "alt": "Alt", "ctrl": "Ctrl", "shift": "Shift"}
+        k_prevent = choice(g, "key_prevent", key_labels, "alt", label="Hold this key while clicking to let\nthe browser download (not OpenDM):", width=18)
+        k_force = choice(g, "key_force", key_labels, "none", label="Hold this key while clicking to always\ndownload with OpenDM (ignores file types):", width=18)
+        g = group(cr, "In the browser")
+        for key, text in (("ctx_link", "Show \"Download link with OpenDM\" in the right-click menu"),
+                          ("ctx_media", "Show \"Download media with OpenDM\" in the right-click menu"),
+                          ("video_button", "Show the \"Download this video\" button on playing videos")):
+            ttk.Checkbutton(g, text=text, variable=cv[key]).pack(anchor="w", pady=2)
+
+        # ---- file types
+        ft = ttk.Frame(nb, padding=12)
+        nb.add(ft, text="File types")
+        ttk.Label(ft, text="Take over downloads of these file types (separate with spaces):").pack(anchor="w")
+        t_cap = textbox(ft, st.get("capture_types", ""), 4)
+        ttk.Label(ft, text="Never take over these (images and web page files, so page content is not captured):").pack(anchor="w")
+        t_skip = textbox(ft, st.get("skip_types", ""), 3)
+        v_unknown = tk.BooleanVar(value=bool(st.get("capture_unknown", True)))
+        ttk.Checkbutton(ft, text="Also take over files whose type is in neither list (for example downloads without an extension)", variable=v_unknown).pack(anchor="w", pady=2)
+        ttk.Label(ft, text="Don't take over downloads from these sites (one per line, * allowed):").pack(anchor="w", pady=(8, 0))
+        t_sites = textbox(ft, st.get("exclude_sites", ""), 3)
+        minkb = tk.IntVar(value=int(st.get("min_size_kb") or 0))
+        mrow = ttk.Frame(ft)
+        mrow.pack(anchor="w")
+        ttk.Label(mrow, text="Ignore browser downloads smaller than (KB, 0 = off):").pack(side="left")
+        ttk.Spinbox(mrow, from_=0, to=10_000_000, width=9, textvariable=minkb).pack(side="left", padx=8)
+
+        def reset_types():
+            for box, key in ((t_cap, "capture_types"), (t_skip, "skip_types")):
+                box.delete("1.0", "end")
+                box.insert("1.0", DEFAULT_SETTINGS[key])
+        ttk.Button(ft, text="Reset lists to defaults", command=reset_types).pack(anchor="w", pady=(8, 0))
+
+        # ---- automatic retry (on the Connection tab)
+        retry_on, retry_n = tk.BooleanVar(value=bool(st.get("auto_retry", True))), tk.IntVar(value=int(st.get("retry_max", 5) or 0))
+        ttk.Checkbutton(cn, text="Retry failed downloads automatically (network errors, busy servers)", variable=retry_on).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        ttk.Label(cn, text="Give up after this many retries:").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Spinbox(cn, from_=1, to=50, width=9, textvariable=retry_n).grid(row=5, column=1, padx=10)
+        ttk.Label(cn, wraplength=440, justify="left", foreground="#6b7280",
+                  text="Retries wait longer each time (15 s, 30 s, 1 min ...) and pause while the internet is down. Wrong passwords and missing files are never retried.").grid(row=6, column=0, columnspan=2, sticky="w")
+
+        timeout, retries = tk.IntVar(value=int(st.get("timeout") or 30)), tk.IntVar(value=int(st.get("retries", 6)))
+        for r, (label, var, lo, hi) in enumerate((("Connection timeout in seconds:", timeout, 5, 300), ("Retries per connection before it gives up:", retries, 0, 30)), 7):
+            ttk.Label(cn, text=label).grid(row=r, column=0, sticky="w", pady=5)
+            ttk.Spinbox(cn, from_=lo, to=hi, width=9, textvariable=var).grid(row=r, column=1, padx=10)
+
+        # ---- proxy
+        px = ttk.Frame(nb, padding=14)
+        nb.add(px, text="Proxy")
+        pmode, ptype = tk.StringVar(value=st.get("proxy_mode", "system")), tk.StringVar(value=st.get("proxy_type", "http"))
+        pv = {k: tk.StringVar(value=str(st.get(k) or "")) for k in ("proxy_host", "proxy_port", "proxy_user", "proxy_pass", "proxy_bypass")}
+        for r, (val, text) in enumerate((("system", "Use the system proxy settings (default)"), ("none", "Connect directly (no proxy)"), ("manual", "Use this proxy:"))):
+            ttk.Radiobutton(px, text=text, value=val, variable=pmode).grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
+        pf = ttk.Frame(px)
+        pf.grid(row=3, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(2, 8))
+        ttk.Label(pf, text="Type:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Combobox(pf, textvariable=ptype, state="readonly", width=10, values=["http", "socks5"]).grid(row=0, column=1, sticky="w")
+        for r, (label, key, hide) in enumerate((("Host:", "proxy_host", ""), ("Port:", "proxy_port", ""), ("User name:", "proxy_user", ""), ("Password:", "proxy_pass", "*")), 1):
+            ttk.Label(pf, text=label).grid(row=r, column=0, sticky="e", padx=(0, 6), pady=3)
+            ttk.Entry(pf, textvariable=pv[key], width=8 if key == "proxy_port" else 34, show=hide).grid(row=r, column=1, sticky="w")
+        ttk.Label(px, text="Don't use the proxy for (example.com, *.corp.test, 10.0.0.0/8):").grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Entry(px, textvariable=pv["proxy_bypass"], width=58).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 8))
+        ptest = ttk.Label(px, text="", wraplength=440, justify="left")
+
+        def proxy_settings():
+            try:
+                port = max(0, min(65535, int(pv["proxy_port"].get() or 0)))
+            except ValueError:
+                port = 0
+            return {"proxy_mode": "manual", "proxy_type": ptype.get(), "proxy_host": pv["proxy_host"].get().strip(), "proxy_port": port,
+                    "proxy_user": pv["proxy_user"].get(), "proxy_pass": pv["proxy_pass"].get(), "proxy_bypass": pv["proxy_bypass"].get()}
+
+        def try_proxy():
+            cfg = proxy_settings()
+            if not cfg["proxy_host"]:
+                return ptest.config(text="Enter the proxy's host first.")
+            ptest.config(text="Testing (needs internet access)...")
+            res = {}
+            threading.Thread(target=lambda: res.update(r=check_proxy(cfg)), daemon=True).start()
+
+            def poll():
+                if "r" in res:
+                    ptest.config(text=("OK - " if res["r"][0] else "Failed - ") + res["r"][1])
+                elif win.winfo_exists():
+                    win.after(200, poll)
+            poll()
+        ttk.Button(px, text="Test proxy", command=try_proxy).grid(row=6, column=0, sticky="w")
+        ptest.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(px, wraplength=440, justify="left", foreground="#6b7280",
+                  text="HTTP proxies carry HTTP and HTTPS downloads. SOCKS5 looks names up on the proxy. FTP, local addresses and (for ffmpeg) SOCKS bypass this setting. "
+                       "The password is stored in OpenDM's settings file, readable only by you.").grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        # ---- site logins
+        lg = ttk.Frame(nb, padding=14)
+        nb.add(lg, text="Logins")
+        logins = [dict(x) for x in st.get("site_logins", []) if isinstance(x, dict) and x.get("host")]
+        ttk.Label(lg, wraplength=440, justify="left", text="User name and password for sites that ask for them (HTTP/HTTPS login prompts and FTP). "
+                                                           "They are given only to the site named here. You can also put them in the link: ftp://name:password@host/file").pack(anchor="w")
+        lv = ttk.Treeview(lg, columns=("host", "user"), show="headings", height=7, selectmode="browse")
+        lv.heading("host", text="Site")
+        lv.heading("user", text="User name")
+        lv.column("host", width=260)
+        lv.column("user", width=160)
+        lv.pack(fill="x", pady=8)
+
+        def refill():
+            lv.delete(*lv.get_children())
+            for i, x in enumerate(logins):
+                lv.insert("", "end", iid=str(i), values=(x["host"], x.get("user", "")))
+
+        def edit_login(new):
+            sel = lv.selection()
+            if not new and not sel:
+                return
+            cur = {"host": "", "user": "", "pass": ""} if new else logins[int(sel[0])]
+            host = simpledialog.askstring("Login", "Site (for example files.example.com):", parent=win, initialvalue=cur["host"])
+            if not host or not host.strip():
+                return
+            user = simpledialog.askstring("Login", "User name:", parent=win, initialvalue=cur.get("user", ""))
+            if user is None:
+                return
+            pw = simpledialog.askstring("Login", "Password:", parent=win, show="*", initialvalue=cur.get("pass", ""))
+            if pw is None:
+                return
+            entry = {"host": _host_of(host.strip()) or host.strip().lower(), "user": user, "pass": pw}
+            logins[:] = [x for x in logins if x["host"] != entry["host"] and x is not cur] + [entry]
+            refill()
+
+        def del_login():
+            sel = lv.selection()
+            if sel:
+                del logins[int(sel[0])]
+                refill()
+        lb = ttk.Frame(lg)
+        lb.pack(anchor="w")
+        ttk.Button(lb, text="Add...", command=lambda: edit_login(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(lb, text="Edit...", command=lambda: edit_login(False)).pack(side="left", padx=6)
+        ttk.Button(lb, text="Remove", command=del_login).pack(side="left", padx=6)
+        refill()
+
+        # ---- appearance
+        ap = ttk.Frame(nb, padding=14)
+        nb.add(ap, text="Appearance")
+        theme = tk.StringVar(value={"light": "Light", "dark": "Dark"}.get(st.get("theme"), "System"))
+        accent = tk.StringVar(value=valid_hex(st.get("accent")) or DEFAULT_ACCENT)
+        ttk.Label(ap, text="Theme:").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Combobox(ap, textvariable=theme, state="readonly", width=12, values=["System", "Light", "Dark"]).grid(row=0, column=1, sticky="w", padx=10)
+        ttk.Label(ap, text="Accent colour:").grid(row=1, column=0, sticky="w", pady=6)
+        sw = ttk.Frame(ap)
+        sw.grid(row=1, column=1, sticky="w", padx=10)
+        prev = tk.Label(ap, width=34, relief="solid", bd=1)
+        prev.grid(row=2, column=1, sticky="w", padx=10, pady=4)
+
+        def show_accent(*_):
+            c = valid_hex(accent.get()) or DEFAULT_ACCENT
+            prev.config(bg=c, fg=contrast_fg(c), text=f"{c}  (selected / progress colour)")
+        accent.trace_add("write", show_accent)
+        show_accent()
+        for name, c in ACCENTS:
+            b = tk.Label(sw, bg=c, width=3, relief="solid", bd=1, cursor="hand2")
+            b.pack(side="left", padx=2)
+            b.bind("<Button-1>", lambda e, c=c: accent.set(c))
+
+        def custom_accent():
+            from tkinter import colorchooser
+            got = colorchooser.askcolor(color=accent.get(), parent=win, title="Accent colour")
+            if got and got[1]:
+                accent.set(got[1])
+        ttk.Button(ap, text="Other colour...", command=custom_accent).grid(row=3, column=1, sticky="w", padx=10)
+        skin = tk.StringVar(value=(st.get("skin") if st.get("skin") in SKINS else "default").title())
+        ttk.Label(ap, text="Skin:").grid(row=4, column=0, sticky="w", pady=(14, 6))
+        ttk.Combobox(ap, textvariable=skin, state="readonly", width=16, values=[n.title() for n in skin_names()]).grid(row=4, column=1, sticky="w", padx=10, pady=(14, 6))
+        ttk.Label(ap, text="Toolbar:").grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Button(ap, text="Customize toolbar...", command=self.customize_toolbar).grid(row=5, column=1, sticky="w", padx=10)
+        ttk.Label(ap, wraplength=440, justify="left", foreground="#6b7280",
+                  text="System follows your operating system's light / dark setting. A skin is a complete colour scheme: it replaces Theme (and its own accent colour "
+                       "is used unless you pick one above). Changes apply when you press OK.").grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
+
+        # ---- sounds
+        so = ttk.Frame(nb, padding=14)
+        nb.add(so, text="Sounds")
+        s_on = tk.BooleanVar(value=bool(st.get("sound", True)))
+        ttk.Checkbutton(so, text="Play sounds", variable=s_on).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ev_on = {ev: tk.BooleanVar(value=bool(st.get("sound_" + ev, True))) for ev, _ in SOUND_EVENTS}
+        ev_file = {ev: tk.StringVar(value=(st.get("sound_files") or {}).get(ev, "")) for ev, _ in SOUND_EVENTS}
+        for r, (ev, label) in enumerate(SOUND_EVENTS, 1):
+            ttk.Checkbutton(so, text=label, variable=ev_on[ev]).grid(row=2 * r - 1, column=0, columnspan=4, sticky="w")
+            ttk.Entry(so, textvariable=ev_file[ev], width=34).grid(row=2 * r, column=0, columnspan=2, sticky="w", padx=(22, 4), pady=(0, 6))
+            ttk.Button(so, text="Browse...", command=lambda v=ev_file[ev]: v.set(filedialog.askopenfilename(parent=win, title="Sound file", filetypes=[("Sound", "*.wav *.ogg *.oga *.mp3 *.aiff"), ("All files", "*.*")]) or v.get())).grid(row=2 * r, column=2, pady=(0, 6))
+            ttk.Button(so, text="Test", command=lambda e=ev, v=ev_file[ev]: self.test_sound(e, v.get().strip())).grid(row=2 * r, column=3, padx=4, pady=(0, 6))
+        s_focus = tk.BooleanVar(value=bool(st.get("sound_unfocused_only")))
+        s_quiet = tk.BooleanVar(value=bool(st.get("sound_quiet")))
+        q_from, q_to = tk.StringVar(value=st.get("sound_quiet_from", "22:00")), tk.StringVar(value=st.get("sound_quiet_to", "07:00"))
+        ttk.Checkbutton(so, text="Only when OpenDM is not the window in front", variable=s_focus).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        qr = ttk.Frame(so)
+        qr.grid(row=9, column=0, columnspan=4, sticky="w")
+        ttk.Checkbutton(qr, text="Quiet hours, no sound from", variable=s_quiet).pack(side="left")
+        ttk.Entry(qr, textvariable=q_from, width=6).pack(side="left", padx=4)
+        ttk.Label(qr, text="to").pack(side="left")
+        ttk.Entry(qr, textvariable=q_to, width=6).pack(side="left", padx=4)
+        ttk.Label(so, wraplength=440, justify="left", foreground="#6b7280",
+                  text="When several things happen at once only the most important sound plays. Leave a file box empty to use the system sound (Windows: .wav files only).").grid(row=10, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        # ---- extras: antivirus, smart links, clipboard history, floating widget
+        ex = ttk.Frame(nb, padding=14)
+        nb.add(ex, text="Extras")
+        av_names = {"Automatic": "auto", "Windows Defender": "defender", "ClamAV": "clamav"}
+        av_on, av_eng = tk.BooleanVar(value=bool(st.get("av_scan", True))), tk.StringVar(value=next((k for k, x in av_names.items() if x == st.get("av_engine")), "Automatic"))
+        ttk.Checkbutton(ex, text="Scan finished downloads with the antivirus installed on this computer", variable=av_on).pack(anchor="w")
+        avr = ttk.Frame(ex)
+        avr.pack(anchor="w", pady=(4, 0))
+        ttk.Label(avr, text="Scanner:").pack(side="left")
+        ttk.Combobox(avr, textvariable=av_eng, state="readonly", width=18, values=list(av_names)).pack(side="left", padx=6)
+        av_det = ttk.Label(ex, wraplength=440, justify="left")
+        av_det.pack(anchor="w", pady=(4, 0))
+
+        def av_status(*_):
+            f = find_av(av_names.get(av_eng.get(), "auto"))
+            av_det.config(text=f"Found: {AV_NAMES[f[0]]}  ({f[1]})" if f else "No antivirus found. Windows Defender and ClamAV are the two OpenDM can use.", foreground="#16a34a" if f else "#d97706")
+        av_eng.trace_add("write", av_status)
+        av_status()
+        ttk.Label(ex, wraplength=440, justify="left", foreground="#6b7280",
+                  text="OpenDM includes no antivirus engine. It runs Windows Defender (MpCmdRun.exe -Scan) or ClamAV (clamscan) and shows the verdict in the Download complete window. "
+                       "It only checks: nothing is deleted or quarantined by OpenDM.").pack(anchor="w", pady=(2, 0))
+        ttk.Separator(ex).pack(fill="x", pady=10)
+        su, cw, wd = (tk.BooleanVar(value=bool(st.get(k))) for k in ("smart_unwrap", "clip_watch", "widget_on"))
+        ttk.Checkbutton(ex, text="Take redirect wrappers off pasted links (google.com/url?q=..., facebook l.php?u=...)", variable=su).pack(anchor="w", pady=2)
+        ttk.Checkbutton(ex, text="Keep a history of links I copy (Tasks > Clipboard history); only web / FTP addresses are kept", variable=cw).pack(anchor="w", pady=2)
+        ttk.Checkbutton(ex, text="Show the floating widget (a small always-on-top speed meter)", variable=wd).pack(anchor="w", pady=2)
+        opr = ttk.Frame(ex)
+        opr.pack(anchor="w", pady=(2, 0))
+        ttk.Label(opr, text="Widget opacity (%):").pack(side="left")
+        wa = tk.IntVar(value=int(st.get("widget_alpha") or 90))
+        ttk.Spinbox(opr, from_=30, to=100, increment=10, textvariable=wa, width=5).pack(side="left", padx=6)
 
         def num(var, lo, hi, default):
             try:
@@ -4696,6 +7136,15 @@ class App:
                 return default
 
         def ok():
+            if pmode.get() == "manual" and not pv["proxy_host"].get().strip():
+                nb.select(px)
+                return messagebox.showerror("Proxy", "Enter the proxy's host, or choose 'Use the system proxy settings'.", parent=win)
+            try:
+                parse_hm(q_from.get())
+                parse_hm(q_to.get())
+            except ValueError:
+                nb.select(so)
+                return messagebox.showerror("Sounds", "Quiet hours must look like 22:00 and 07:00.", parent=win)
             f = folder.get().strip()
             if f:
                 self.folder.set(f)
@@ -4714,6 +7163,40 @@ class App:
                     want = False
             st.update(tray=want, close_to_tray=v["close_to_tray"].get(), notify=v["notify"].get(), start_minimized=v["start_minimized"].get(),
                       show_complete_dialog=v["show_complete_dialog"].get(), confirm_captured=v["confirm_captured"].get())
+            st["auto_retry"], st["retry_max"] = retry_on.get(), num(retry_n, 1, 50, 5)
+            px_new = proxy_settings()
+            st.update(proxy_mode=pmode.get(), proxy_type=px_new["proxy_type"], proxy_host=px_new["proxy_host"], proxy_port=px_new["proxy_port"],
+                      proxy_user=px_new["proxy_user"], proxy_pass=px_new["proxy_pass"], proxy_bypass=px_new["proxy_bypass"].strip(),
+                      site_logins=logins, theme=theme.get().lower(), accent=valid_hex(accent.get()) or DEFAULT_ACCENT,
+                      sound=s_on.get(), sound_unfocused_only=s_focus.get(), sound_quiet=s_quiet.get(), sound_quiet_from=q_from.get().strip(),
+                      sound_quiet_to=q_to.get().strip(), sound_files={e: v.get().strip() for e, v in ev_file.items() if v.get().strip()},
+                      **{"sound_" + e: v.get() for e, v in ev_on.items()})
+            was_watching = bool(st.get("clip_watch"))
+            st.update(skin=skin.get().lower(), av_scan=av_on.get(), av_engine=av_names.get(av_eng.get(), "auto"), smart_unwrap=su.get(), clip_watch=cw.get(), widget_alpha=num(wa, 30, 100, 90))
+            if cw.get() and not was_watching:
+                self._clip_last = None  # whatever is on the clipboard right now was not copied "just now"
+            if wd.get() != self.widget.shown:
+                self.toggle_widget(wd.get())
+            else:
+                self.widget.set_alpha()
+            st["timeout"], st["retries"] = num(timeout, 5, 300, 30), num(retries, 0, 30, 6)
+            st["temp_folder"] = temp.get().strip()
+            st.update(capture_downloads=cv["capture_downloads"].get(), clip_monitor=gv["clip_monitor"].get(), ctx_link=cv["ctx_link"].get(), ctx_media=cv["ctx_media"].get(),
+                      video_button=cv["video_button"].get(), capture_browsers={k: x.get() for k, x in br_vars.items()}, key_prevent=k_prevent(), key_force=k_force(),
+                      capture_types=" ".join(split_list(read(t_cap))), skip_types=" ".join(split_list(read(t_skip))), capture_unknown=v_unknown.get(),
+                      exclude_sites=read(t_sites), min_size_kb=num(minkb, 0, 10_000_000, 0), dup_links=dup_get(), file_exists=exist_get(),
+                      )
+            st["check_updates"] = gv["check_updates"].get()
+            self._autoclip_last = None  # whatever is on the clipboard right now was not copied "just now"
+            want_auto = gv["autostart"].get()
+            if want_auto != bool(st.get("autostart")):
+                err = set_autostart(want_auto)
+                if err:
+                    messagebox.showinfo("Start with the computer", f"Couldn't change the start-up setting:\n{err}", parent=win)
+                    want_auto = bool(st.get("autostart"))
+            st["autostart"] = want_auto
+            self.mgr.apply_network()  # proxy, logins and timeouts take effect for the next connection
+            self.apply_theme()
             self.mgr.save_settings()
             win.destroy()
             self.flash("Options saved")
@@ -5050,7 +7533,15 @@ QUEUES AND THE SCHEDULER
   selected in the left pane (the main queue by default). Downloads > Scheduler restricts downloading to a time window.
 
 SPEED
-  Downloads > Speed limiter caps the total speed. View > Speed graph shows the live chart and the segment map.""")
+  Downloads > Speed limiter caps the total speed. View > Speed graph shows the live chart and the segment map.
+
+EXTRAS
+  Antivirus: finished files are checked by Windows Defender or ClamAV if one is installed (OpenDM has no engine of its own); the
+  verdict is in the Download complete window. File > Scan for viruses checks a file again. Options > Extras.
+  Resolve link... (Add dialog) finds the real file behind a short link, a redirect or a download page. It reports login and payment
+  walls instead of trying to get around them.
+  Tasks > Clipboard history keeps the links you copy (turn it on first). View > Floating widget shows a small speed meter.
+  Right-click the toolbar, or View > Customize toolbar, to choose and order its buttons. Options > Appearance has skins.""")
 
     def shortcuts_dialog(self):
         self.text_dialog("Keyboard shortcuts", """Ctrl+N        Add new download
@@ -5145,19 +7636,29 @@ Ctrl+C        Copy the address of the selected downloads""", width=60, height=12
 
     def update_toolbar(self):
         fl = self.flags()
-        for icon, rule in (("resume", "resumable"), ("stop", "active"), ("stopall", "anyactive"), ("delete", "sel"), ("delc", "anydone")):
-            self.tbtn[icon].state(["!disabled"] if fl[rule] else ["disabled"])
+        for icon, rule in (("resume", "resumable"), ("stop", "active"), ("stopall", "anyactive"), ("delete", "sel"), ("delc", "anydone"), ("scan", "done")):
+            if icon in self.tbtn:  # the user may have taken the button off the toolbar
+                self.tbtn[icon].state(["!disabled"] if fl[rule] else ["disabled"])
 
     def tick(self):
-        if self.mgr.schedule() and self.after_done():
+        fin = self.mgr.schedule()
+        self._guard(self.collect_sounds, fin)
+        if fin and self.after_done():
             return
+        self._guard(self.follow_system_theme)
         total = sum(d.speed for d in self.mgr.items)
         self.notify_changes()
         self._guard(self.drain_captured)
         self._guard(self.check_completed)
+        self._guard(self.watch_scans)
+        self._guard(self.report_manual_scans)
+        self._guard(self.watch_clipboard)
+        self._guard(self.poll_clipboard)
+        self._guard(self.poll_update_check)
         self.draw_list()
         self.update_side()
         self.update_toolbar()
+        self._guard(self.widget.update)
         self._guard(self.update_progress_windows)
         if self.tray:
             tip = tray_tooltip(self.mgr.items, total)
@@ -5174,6 +7675,523 @@ Ctrl+C        Copy the address of the selected downloads""", width=60, height=12
         if int(time.time()) % 3 == 0:
             self.mgr.save()
         self.root.after(500, self.tick)
+
+    # ------------------------------------------------------------------ toolbar: layout, style, customizing
+    STYLE_LABELS = {"both": "Icons and text", "icons": "Icons only", "text": "Text only"}
+    SIZE_LABELS = {"large": "Large icons", "small": "Small icons"}
+
+    def rebuild_toolbar(self):
+        """(Re)draw the toolbar from the settings: which buttons, in what order, icons and/or text, large or small."""
+        st = self.mgr.settings
+        for w in self.toolbar.winfo_children():
+            w.destroy()
+        self.tbtn = {}
+        style = st.get("toolbar_style") if st.get("toolbar_style") in TOOLBAR_STYLES else "both"
+        size = st.get("toolbar_size") if st.get("toolbar_size") in TOOLBAR_SIZES else "large"
+        icons = self.icons_small if size == "small" else self.icons
+        for bid in toolbar_layout(st.get("toolbar_items"), DEFAULT_TOOLBAR, TOOLBAR_ACTIONS):
+            if bid == "|":
+                ttk.Separator(self.toolbar, orient="vertical").pack(side="left", fill="y", padx=5, pady=3)
+                continue
+            icon, label, meth = TOOLBAR_ACTIONS[bid]
+            if style == "text":
+                kw = {"text": label}
+            elif style == "icons":
+                kw = {"image": icons[icon]}
+            else:
+                kw = {"text": label, "image": icons[icon], "compound": "top" if size == "large" else "left"}
+            b = ttk.Button(self.toolbar, style="Toolbutton", command=getattr(self, meth), **kw)
+            b.pack(side="left", padx=1)
+            b.bind("<Button-3>", self._toolbar_menu)
+            b.bind("<Control-Button-1>", self._toolbar_menu)
+            if style == "icons":
+                Tip(b, label)
+            self.tbtn[bid] = b
+        for ev in ("<Button-3>", "<Control-Button-1>"):
+            self.toolbar.bind(ev, self._toolbar_menu)
+        if hasattr(self, "tree"):
+            self.update_toolbar()
+
+    def _toolbar_menu(self, e):
+        m = tk.Menu(self.root, tearoff=0)
+        cur = self.mgr.settings.get("toolbar_style", "both")
+        for key in TOOLBAR_STYLES:
+            m.add_command(label=self.STYLE_LABELS[key] + ("   \u2713" if cur == key else ""), command=lambda k=key: self.set_toolbar(style=k))
+        m.add_separator()
+        m.add_command(label="Customize toolbar...", command=self.customize_toolbar)
+        self._popup(m, e)
+
+    def set_toolbar(self, items=False, style=None, size=None):
+        st = self.mgr.settings
+        if items is not False:
+            st["toolbar_items"] = items
+        if style:
+            st["toolbar_style"] = style
+        if size:
+            st["toolbar_size"] = size
+        self.mgr.save_settings()
+        self.rebuild_toolbar()
+
+    def customize_toolbar(self):
+        st = self.mgr.settings
+        win = tk.Toplevel(self.root)
+        win.title("Customize toolbar")
+        win.transient(self.root)
+        items = toolbar_layout(st.get("toolbar_items"), DEFAULT_TOOLBAR, TOOLBAR_ACTIONS)
+        avail = []
+        name = lambda b: "-------- separator --------" if b == "|" else TOOLBAR_ACTIONS[b][1]
+        frm = ttk.Frame(win, padding=12)
+        frm.pack()
+        ttk.Label(frm, text="On the toolbar (left to right):").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text="Available:").grid(row=0, column=2, sticky="w")
+        lb_cur = tk.Listbox(frm, height=15, width=26, exportselection=False)
+        lb_cur.grid(row=1, column=0)
+        lb_av = tk.Listbox(frm, height=15, width=26, exportselection=False)
+        lb_av.grid(row=1, column=2)
+        mid = ttk.Frame(frm)
+        mid.grid(row=1, column=1, padx=10)
+
+        def refill(select=None):
+            lb_cur.delete(0, "end")
+            for b in items:
+                lb_cur.insert("end", name(b))
+            avail[:] = [b for b in TOOLBAR_ACTIONS if b not in items] + ["|"]
+            lb_av.delete(0, "end")
+            for b in avail:
+                lb_av.insert("end", name(b))
+            if select is not None and items:
+                lb_cur.selection_set(max(0, min(select, len(items) - 1)))
+            lb_av.selection_set(0)
+
+        def add():
+            sel, at = lb_av.curselection(), lb_cur.curselection()
+            if sel:
+                pos = at[0] + 1 if at else len(items)
+                items.insert(pos, avail[sel[0]])
+                refill(pos)
+
+        def remove():
+            sel = lb_cur.curselection()
+            if sel:
+                items.pop(sel[0])
+                refill(sel[0])
+
+        def move(delta):
+            sel = lb_cur.curselection()
+            if sel and 0 <= sel[0] + delta < len(items):
+                i, j = sel[0], sel[0] + delta
+                items[i], items[j] = items[j], items[i]
+                refill(j)
+        for text, fn in (("Add  >>", add), ("<<  Remove", remove), ("Move up", lambda: move(-1)), ("Move down", lambda: move(1))):
+            ttk.Button(mid, text=text, command=fn, width=11).pack(pady=3)
+        style = tk.StringVar(value=self.STYLE_LABELS.get(st.get("toolbar_style"), self.STYLE_LABELS["both"]))
+        size = tk.StringVar(value=self.SIZE_LABELS.get(st.get("toolbar_size"), self.SIZE_LABELS["large"]))
+        opt = ttk.Frame(win, padding=(12, 0))
+        opt.pack(fill="x")
+        ttk.Label(opt, text="Buttons show:").pack(side="left")
+        ttk.Combobox(opt, textvariable=style, state="readonly", width=16, values=list(self.STYLE_LABELS.values())).pack(side="left", padx=(4, 14))
+        ttk.Combobox(opt, textvariable=size, state="readonly", width=14, values=list(self.SIZE_LABELS.values())).pack(side="left")
+
+        def reset():
+            items[:] = DEFAULT_TOOLBAR
+            style.set(self.STYLE_LABELS["both"])
+            size.set(self.SIZE_LABELS["large"])
+            refill(0)
+
+        def ok():
+            back = lambda labels, v: next(k for k, t in labels.items() if t == v.get())
+            final = toolbar_layout(items, DEFAULT_TOOLBAR, TOOLBAR_ACTIONS)
+            self.set_toolbar(items=None if final == DEFAULT_TOOLBAR else final, style=back(self.STYLE_LABELS, style), size=back(self.SIZE_LABELS, size))
+            win.destroy()
+        row = ttk.Frame(win)
+        row.pack(pady=12)
+        ttk.Button(row, text="OK", command=ok).pack(side="left", padx=6)
+        ttk.Button(row, text="Reset to default", command=reset).pack(side="left", padx=6)
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="left", padx=6)
+        refill(0)
+
+    # ------------------------------------------------------------------ floating widget
+    def toggle_widget(self, on=None):
+        on = (not self.widget.shown) if on is None else bool(on)
+        self.show_widget.set(on)
+        self.mgr.settings["widget_on"] = on
+        self.mgr.save_settings()
+        self.widget.show() if on else self.widget.hide()
+
+    # ------------------------------------------------------------------ clipboard history
+    def watch_clipboard(self):
+        """While 'keep a history of copied links' is on, notice new clipboard text about once a second. Only the web / FTP addresses in it are kept."""
+        if not self.mgr.settings.get("clip_watch"):
+            return
+        now = time.time()
+        if now - self._clip_check < 1.0:
+            return
+        self._clip_check = now
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:  # empty, or not text
+            text = ""
+        if self._clip_last is None:  # just switched on: what is already on the clipboard was not copied "now"
+            self._clip_last = text
+            return
+        if text == self._clip_last:
+            return
+        self._clip_last = text
+        new = self.clips.add_text(text)
+        if new:
+            self.flash(f"Saved {len(new)} copied link{'s' if len(new) > 1 else ''} to Tasks > Clipboard history")
+            self._fill_clip_list()
+
+    def download_links(self, urls, later=False):
+        """Add links (from the clipboard history ...) to the queue shown on the left, with redirect wrappers peeled off if that option is on."""
+        added = []
+        for u in urls:
+            if self.mgr.settings.get("smart_unwrap", True):
+                u = unwrap_url(u)[0]
+            try:
+                added.append(self.mgr.add(u, self.folder.get(), self.conns.get(), queue=self.cur_queue(), later=later))
+            except ValueError as e:
+                messagebox.showerror("OpenDM", str(e), parent=self.root)
+        self.after_change()
+        if not later:
+            for d in added[:3]:
+                self.progress_window(d)
+        return added
+
+    def _fill_clip_list(self):
+        tv = getattr(self, "_clip_tree", None)
+        try:
+            if tv is None or not tv.winfo_exists():
+                return
+            tv.delete(*tv.get_children())
+            for i, x in enumerate(self.clips.items):
+                tv.insert("", "end", iid=str(i), values=(x["url"], fmt_when(x["t"]) if x["t"] else ""))
+        except tk.TclError:
+            pass
+
+    def clipboard_dialog(self):
+        st = self.mgr.settings
+        old = getattr(self, "_clip_win", None)
+        try:
+            if old is not None and old.winfo_exists():
+                self._front(old)
+                return
+        except tk.TclError:
+            pass
+        win = self._clip_win = tk.Toplevel(self.root)
+        win.title("Clipboard history")
+        win.transient(self.root)
+        win.geometry("760x420")
+        watch = tk.BooleanVar(value=bool(st.get("clip_watch")))
+
+        def set_watch():
+            st["clip_watch"] = watch.get()
+            self._clip_last = None
+            self.mgr.save_settings()
+        ttk.Checkbutton(win, text="Keep a history of links I copy (only web and FTP addresses are kept - never other clipboard text)", variable=watch, command=set_watch).pack(anchor="w", padx=12, pady=(10, 4))
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=12)
+        tv = self._clip_tree = ttk.Treeview(box, columns=("url", "when"), show="headings", selectmode="extended")
+        tv.heading("url", text="Link")
+        tv.heading("when", text="Copied")
+        tv.column("url", width=520)
+        tv.column("when", width=170)
+        sb = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+
+        def chosen():
+            rows = tv.selection() or tv.get_children()  # nothing selected = all of them
+            return [self.clips.items[int(i)]["url"] for i in rows if int(i) < len(self.clips.items)]
+
+        def need(urls):
+            if not urls:
+                messagebox.showinfo("Clipboard history", "There are no links yet. Turn on the check box above, then copy a link.", parent=win)
+            return bool(urls)
+
+        def download(later=False):
+            urls = chosen()
+            if need(urls):
+                self.download_links(urls, later)
+                if later:
+                    self.flash(f"{len(urls)} link(s) added; start them when you like")
+
+        def copy():
+            urls = chosen()
+            if need(urls):
+                self.root.clipboard_clear()
+                self.root.clipboard_append("\n".join(urls))
+                self._clip_last = "\n".join(urls)  # our own copy is not a new entry
+
+        def remove():
+            sel = [self.clips.items[int(i)]["url"] for i in tv.selection() if int(i) < len(self.clips.items)]
+            if sel:
+                self.clips.remove(sel)
+                self._fill_clip_list()
+
+        def clear():
+            if self.clips.items and messagebox.askyesno("Clipboard history", "Delete the whole history?", parent=win):
+                self.clips.clear()
+                self._fill_clip_list()
+        tv.bind("<Double-1>", lambda e: download() if tv.identify_row(e.y) else None)
+        row = ttk.Frame(win)
+        row.pack(pady=10)
+        for text, fn in (("Download", download), ("Download later", lambda: download(True)), ("Copy", copy), ("Remove", remove), ("Clear all", clear), ("Close", win.destroy)):
+            ttk.Button(row, text=text, command=fn).pack(side="left", padx=4)
+        self._fill_clip_list()
+
+    # ------------------------------------------------------------------ antivirus
+    def scan_selected(self):
+        """File > Scan for viruses: run the installed antivirus over the selected finished files and report."""
+        st = self.mgr.settings
+        ds = [d for d in self.selected() if d.status == "Completed" and d.path and os.path.exists(d.path)]
+        if not ds:
+            return self.info("Scan for viruses", "Select a finished download first.")
+        if not find_av(st.get("av_engine", "auto")):
+            return self.info("Scan for viruses", "No antivirus was found.\n\nOpenDM has no scanner of its own: it asks Windows Defender (MpCmdRun.exe) or ClamAV (clamscan) "
+                             "when one is installed. Install one of them, or change the scanner under Options > Extras.")
+        for d in ds:
+            d._threat_told = True  # this scan reports itself below
+            d.scan_async(st.get("av_engine", "auto"), force=True)
+            self.scan_watch.append(d)
+        self.flash(f"Scanning {len(ds)} file(s)...")
+
+    def report_manual_scans(self):
+        if self.scan_watch and not any(d._scanning for d in self.scan_watch):
+            done, self.scan_watch = self.scan_watch, []
+            text = "\n\n".join(f"{d.label}\n{d.scan_info}" for d in done)
+            (messagebox.showwarning if any(d.scan == "infected" for d in done) else messagebox.showinfo)("Scan for viruses", text, parent=self.root)
+
+    def watch_scans(self):
+        """A threat found after the Download complete window was already dismissed (slow scan) must still be seen."""
+        for d in self.mgr.items:
+            if d.scan == "infected" and not getattr(d, "_threat_told", False):
+                d._threat_told = True
+                self.flash(f"THREAT FOUND in {d.label}", 20)
+                if self.tray and self.mgr.settings.get("notify", True):
+                    self.tray.notify(f"Antivirus: threat found in {d.label}")
+                if not getattr(d, "_scan_shown", False):
+                    messagebox.showwarning("OpenDM - threat found", f"{d.label}\n\n{d.scan_info}\n\nThe file was kept where it is; OpenDM doesn't delete or open it.", parent=self.root)
+
+    # ------------------------------------------------------------------ smart links (Add dialog)
+    def resolve_in_dialog(self, win, txt, note):
+        """Work out the real file behind each pasted link (redirects, shorteners, 'your download starts soon' pages). Runs in the background."""
+        lines = [x.strip() for x in txt.get("1.0", "end").splitlines() if x.strip()]
+        urls = [x for x in lines if x.lower().startswith(("http://", "https://"))][:20]
+        if not urls:
+            note.config(text="Paste an http:// or https:// address first.")
+            return
+        note.config(text=f"Looking at {len(urls)} link(s)...")
+        out, results = queue.Queue(), []
+
+        def work():
+            for u in urls:
+                try:
+                    out.put((u, resolve_link(u)))
+                except Exception as e:
+                    out.put((u, {"url": u, "state": "failed", "note": str(e), "steps": [], "candidates": []}))
+            out.put(None)
+        threading.Thread(target=work, daemon=True).start()
+
+        def finish():
+            notes, mapping = [], {}
+            for u, r in results:
+                short = u if len(u) < 56 else u[:53] + "..."
+                if r["state"] == "choose":
+                    pick = self.choose_link(win, u, r["candidates"])
+                    if pick:
+                        mapping[u] = pick
+                    notes.append(f"{short}: " + ("picked the link you chose" if pick else "left as it was"))
+                elif r["state"] in ("direct", "resolved"):
+                    if r["url"] != u:
+                        mapping[u] = r["url"]
+                    notes.append(f"{short}: {r['note'] or 'ok'}")
+                else:
+                    notes.append(f"{short}: {r['note'] or r['state']}")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", "\n".join(mapping.get(x, x) for x in lines))
+            note.config(text="\n".join(notes))
+
+        def poll():
+            if not win.winfo_exists():
+                return
+            try:
+                while True:
+                    item = out.get_nowait()
+                    if item is None:
+                        return finish()
+                    results.append(item)
+            except queue.Empty:
+                win.after(150, poll)
+        poll()
+
+    def choose_link(self, parent, source, cands):
+        dlg = tk.Toplevel(parent)
+        dlg.title("Which link is the file?")
+        dlg.transient(parent)
+        ttk.Label(dlg, text=f"{source}\nhas several links that could be the file:", justify="left", wraplength=640).pack(anchor="w", padx=12, pady=(12, 4))
+        lb = tk.Listbox(dlg, width=96, height=min(8, len(cands)), exportselection=False)
+        lb.pack(padx=12)
+        for c in cands:
+            lb.insert("end", f"{(c['text'] or '(no text)')[:36]:<38}{c['url']}")
+        lb.selection_set(0)
+        result = [None]
+
+        def ok():
+            sel = lb.curselection()
+            result[0] = cands[sel[0]]["url"] if sel else None
+            dlg.destroy()
+        lb.bind("<Double-1>", lambda e: ok())
+        row = ttk.Frame(dlg)
+        row.pack(pady=10)
+        ttk.Button(row, text="Use this link", command=ok).pack(side="left", padx=6)
+        ttk.Button(row, text="Keep the original", command=dlg.destroy).pack(side="left", padx=6)
+        self._front(dlg)
+        dlg.grab_set()
+        dlg.wait_window()
+        return result[0]
+
+    # ------------------------------------------------------------------ updates (GitHub Releases)
+    def start_update_check(self, manual=False):
+        """Asks GitHub in the background. The answer is picked up by poll_update_check() on the GUI thread."""
+        if self._upd_busy:
+            return
+        self._upd_busy = True
+
+        def run():
+            try:
+                res = ("ok", check_for_update())
+            except Exception as e:
+                res = ("error", str(e) or e.__class__.__name__)
+            self.update_q.put((manual, res))
+        threading.Thread(target=run, daemon=True).start()
+
+    def poll_update_check(self):
+        if self._upd_pending and self.update_info and self.root.state() == "normal" and not (self._upd_win and self._upd_win.winfo_exists()):
+            self._upd_pending = False  # an update was found while OpenDM sat in the tray: offer it as soon as the window is opened
+            self.update_dialog(self.update_info)
+        while True:
+            try:
+                manual, (state, val) = self.update_q.get_nowait()
+            except queue.Empty:
+                return
+            self._upd_busy = False
+            if state == "error":
+                if manual:
+                    messagebox.showerror("Check for updates", f"Could not check for updates:\n{val}", parent=self.root)
+            elif val["newer"]:
+                self.update_info = val
+                if not manual and self.root.state() in ("withdrawn", "iconic"):
+                    self._upd_pending = True
+                    if self.tray:
+                        self.tray.notify(f"OpenDM {val['version']} is available. Open the window to update.")
+                else:
+                    self.update_dialog(val)
+            elif manual:
+                self.info("Check for updates", f"You have the latest version (OpenDM {__version__}).")
+
+    def update_dialog(self, info):
+        """'OpenDM x.y.z is available': release notes, then Update now / Later. Update now downloads the right file for this copy
+        (portable .exe or installer), shows the progress, and hands over to a helper script that restarts OpenDM when it is done."""
+        if self._upd_win and self._upd_win.winfo_exists():
+            return self._front(self._upd_win)
+        kind, asset = info["kind"], info["asset"]
+        auto = kind in ("portable", "installed") and bool(asset)
+        win = self._upd_win = tk.Toplevel(self.root)
+        win.title("Update available")
+        win.transient(self.root)
+        win.resizable(True, True)
+        ttk.Label(win, text=f"OpenDM {info['version']} is available", font=("TkDefaultFont", 13, "bold")).pack(anchor="w", padx=14, pady=(14, 0))
+        how = ({"portable": "The portable version will be downloaded and replaced in place; OpenDM then restarts by itself.",
+                "installed": "The installer will be downloaded and run for you; OpenDM then restarts by itself."}[kind] if auto
+               else "This copy of OpenDM can't update itself, so the download page will open in your browser.")
+        ttk.Label(win, text=f"You are using version {__version__}. {how}", wraplength=520, justify="left").pack(anchor="w", padx=14, pady=(2, 8))
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=14)
+        t = tk.Text(box, width=70, height=12, wrap="word", padx=8, pady=6)
+        sb = ttk.Scrollbar(box, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True)
+        t.insert("1.0", info["notes"])
+        t.config(state="disabled")
+        busy = sum(1 for d in self.mgr.items if d.status in ACTIVE)
+        if busy and auto:
+            ttk.Label(win, text=f"{busy} active download{'s' if busy != 1 else ''} will be paused now and can be resumed after the restart.",
+                      wraplength=520, justify="left").pack(anchor="w", padx=14, pady=(8, 0))
+        status = ttk.Label(win, text="", wraplength=520, justify="left")
+        bar = ttk.Progressbar(win, mode="determinate", maximum=100)
+        row = ttk.Frame(win)
+        row.pack(side="bottom", pady=12)
+        now = ttk.Button(row, text="Update now" if auto else "Open download page")
+        later = ttk.Button(row, text="Later")
+        now.pack(side="left", padx=6)
+        later.pack(side="left", padx=6)
+        run = {"stop": threading.Event(), "busy": False}
+
+        def close():
+            run["stop"].set()
+            if win.winfo_exists():
+                win.destroy()
+
+        def fail(msg):
+            run["busy"] = False
+            bar.pack_forget()
+            status.config(text=msg)
+            status.pack(anchor="w", padx=14, pady=(8, 0))
+            now.state(["!disabled"])
+            later.config(text="Later", command=close)
+
+        def go():
+            if not auto:
+                import webbrowser
+                webbrowser.open(info["page"])
+                return close()
+            try:
+                dest = stage_path(kind, asset)
+            except Exception as e:
+                return fail(str(e))
+            run["stop"].clear()
+            run["busy"] = True
+            st = {"done": 0, "total": int(asset.get("size") or 0), "err": "", "fin": False}
+            now.state(["disabled"])
+            later.config(text="Cancel")
+            status.config(text="Downloading...")
+            status.pack(anchor="w", padx=14, pady=(8, 0))
+            bar.pack(fill="x", padx=14, pady=(4, 0))
+
+            def work():
+                try:
+                    st["path"] = download_update(asset, dest, progress=lambda d, tot: st.update(done=d, total=tot or st["total"]), stop=run["stop"])
+                except Exception as e:
+                    st["err"] = str(e)
+                st["fin"] = True
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                if not win.winfo_exists():
+                    return
+                if not st["fin"]:
+                    pct = st["done"] * 100 / st["total"] if st["total"] else 0
+                    bar.config(value=pct)
+                    status.config(text=f"Downloading...  {human(st['done'])}" + (f" of {human(st['total'])}  ({pct:.0f}%)" if st["total"] else ""))
+                    return win.after(120, poll)
+                if st["err"]:
+                    return fail("" if st["err"] == "Cancelled." else st["err"])
+                bar.config(value=100)
+                status.config(text="Installing the update. OpenDM will restart in a moment...")
+                try:
+                    apply_update(kind, st["path"])
+                except Exception as e:
+                    return fail(f"Could not start the update: {e}")
+                win.after(400, self.on_close)  # pauses the downloads, saves, quits; the helper script takes over from here
+            poll()
+
+        now.config(command=go)
+        later.config(command=close)
+        win.protocol("WM_DELETE_WINDOW", close)
+        self._front(win)
 
     # ------------------------------------------------------------------ closing and starting
     def on_close(self):  # really quit
@@ -5195,7 +8213,11 @@ Ctrl+C        Copy the address of the selected downloads""", width=60, height=12
         if self.mgr.settings.get("tray", True):
             self.set_tray(True)  # if it can't start, Options explains why
         self.poll_tray()
+        if self.mgr.settings.get("widget_on"):
+            self.widget.show()
         self.tick()
+        if self.mgr.settings.get("check_updates", True) and not os.environ.get("OPENDM_NO_UPDATE_CHECK"):
+            self.root.after(4000, self.start_update_check)  # a few seconds after start-up, in the background; silent when there is nothing new or no internet
         if self.minimized or self.mgr.settings.get("start_minimized"):
             self.root.withdraw() if self.tray else self.root.iconify()
         self.root.mainloop()
@@ -5209,13 +8231,29 @@ def run_gui(port=API_PORT, minimized=False):
 
 # ============================== CLI ==============================
 def run_cli(args):
+    """Returns the exit code: 0 if every download finished (and matched its checksum), 1 if not, 2 for a bad option."""
     mgr = Manager(args.max_active, persist=False)
+    mgr.settings["av_scan"] = False  # the CLI scans only with --scan, after the download
     mgr.set_limit_kb(args.limit)
     mgr.settings["folder"], mgr.settings["auto_sort"] = os.path.expanduser(args.output), args.sort
     mgr.settings["quality"] = args.quality
-    ds = [mgr.add(u, os.path.expanduser(args.output), args.connections) for u in args.urls]
+    checksum = getattr(args, "checksum", "") or ""
+    if checksum and len(args.urls) != 1:
+        print("--checksum needs exactly one address")
+        return 2
     try:
-        while any(d.status not in ("Completed", "Error") for d in ds):
+        if getattr(args, "proxy", None):
+            mgr.settings.update(parse_proxy(args.proxy))
+            mgr.apply_network()
+        ds = [mgr.add(u, os.path.expanduser(args.output), args.connections, **({"checksum": checksum} if checksum else {})) for u in args.urls]
+    except ValueError as e:
+        print(f"OpenDM: {e}")
+        return 2
+
+    def pending(d):  # not finished, or finished but its checksum hasn't been compared yet, or failed but about to be retried
+        return d.status not in ("Completed", "Error") or (d.status == "Completed" and d.checksum and not d.verified) or mgr.will_retry(d)
+    try:
+        while any(pending(d) for d in ds):
             mgr.schedule()
             line = " | ".join(f"{(d.name or '...')[:25]} {d.percent:5.1f}% {human(d.speed)}/s" for d in ds)
             print("\r" + line[:110].ljust(110), end="", flush=True)
@@ -5224,10 +8262,19 @@ def run_cli(args):
         for d in ds:
             d.pause()
         print("\nInterrupted.")
-        return
+        return 130
     print()
+    bad = 0
     for d in ds:
         print(f"{d.status}: {d.path or d.url} {d.error}")
+        if d.checksum:
+            print(f"  {d.checksum.split(':')[0].upper()}: " + {"ok": "matches", "bad": f"DOES NOT MATCH (the file's is {d.actual_hash})", "missing": "file not found"}.get(d.verified, "not checked"))
+        bad += d.status != "Completed" or d.verified in ("bad", "missing")
+        if getattr(args, "scan", False) and d.status == "Completed":
+            res = scan_file(d.path)
+            print("  " + av_summary(res))
+            bad += res["state"] == "infected"
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
@@ -5247,6 +8294,9 @@ if __name__ == "__main__":
     p.add_argument("-l", "--limit", type=int, default=0, help="speed limit in KB/s (0 = unlimited)")
     p.add_argument("-q", "--quality", type=int, default=0, help="max video height for HLS streams (0 = best)")
     p.add_argument("-p", "--port", type=int, default=API_PORT, help="browser-extension API port (GUI mode)")
+    p.add_argument("--checksum", default="", metavar="HASH", help="CLI: expected MD5 / SHA-1 / SHA-256 / SHA-512 of the (single) file, e.g. sha256:ab12... - exit code 1 if it doesn't match")
+    p.add_argument("--scan", action="store_true", help="CLI: scan each finished file with Windows Defender or ClamAV if one is installed (exit code 1 if a threat is found)")
+    p.add_argument("--proxy", default="", metavar="URL", help="CLI: use this proxy, e.g. http://user:pw@host:3128 or socks5://host:1080")
     a = p.parse_args()
     if a.register_browsers or a.unregister_browsers or a.extension_id:
         mg = Manager(persist=True)
@@ -5262,4 +8312,6 @@ if __name__ == "__main__":
             for r in ni.register():
                 print(f"{r['label']:16} {'registered' if r['registered'] else 'skipped'}  {r['detail']}")
         sys.exit(0)
-    run_cli(a) if a.urls else run_gui(a.port, a.minimized)
+    if a.urls:
+        sys.exit(run_cli(a) or 0)
+    run_gui(a.port, a.minimized)

@@ -30,7 +30,7 @@ echo Using: %ISCC%
 
 "%ISCC%" "installer\OpenDM.iss" || goto :fail
 echo.
-echo DONE: dist\OpenDM-Setup-1.5.0.exe
+echo DONE: dist\OpenDM-Setup-1.6.0.exe
 pause
 exit /b 0
 

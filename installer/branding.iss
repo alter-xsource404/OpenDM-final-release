@@ -1,0 +1,6 @@
+#define AppVersion "1.6.0"
+#define AppPublisher "NovaTorrent Forge"
+#define AppURL "https://github.com/alter-xsource404/OpenDM-final-release"
+#define AppSupportURL "https://github.com/alter-xsource404/OpenDM-final-release"
+#define AppCopyright "Copyright (C) 2026 Rifat Howlader"
+#define AppDescription "OpenDM - fast, lightweight, open-source download manager"

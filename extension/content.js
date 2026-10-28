@@ -1,4 +1,4 @@
-// OpenDM content script - v1.5
+// OpenDM content script - v1.6
 // ONLY the IDM-style "Download this video" button on playing <video> elements (drag it, double-click resets, x hides it for that video).
 // FIX (#2): the "OpenDM Video Sniffer" floating panel/bubble was removed completely.
 // FIX (no sound): the menu now lists yt-dlp's formats (video+audio merged by OpenDM/ffmpeg) whenever the page is supported;
@@ -13,11 +13,12 @@
 
   // FIX (phantom downloads): tell the background script when the user really interacts with this page, so only downloads
   // that follow a real click/key/right-click are taken over. Scripts cannot fake these (isTrusted).
+  // The held modifier keys ride along: they are the "prevent / force downloading with OpenDM" keys from OpenDM's Configuration.
   let lastGesture = 0;
   const gesture = (e) => {
-    if (!e.isTrusted || Date.now() - lastGesture < 1000) return;
+    if (!e.isTrusted || (e.type !== "pointerdown" && Date.now() - lastGesture < 300)) return;
     lastGesture = Date.now();
-    try { Promise.resolve(api.runtime.sendMessage({ cmd: "gesture" })).catch(() => {}); } catch {}
+    try { Promise.resolve(api.runtime.sendMessage({ cmd: "gesture", alt: e.altKey, ctrl: e.ctrlKey, shift: e.shiftKey })).catch(() => {}); } catch {}
   };
   for (const t of ["pointerdown", "keydown", "contextmenu", "touchstart"]) addEventListener(t, gesture, { capture: true, passive: true });
   const ICON = "data:image/png;base64,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";
@@ -202,8 +203,10 @@
   const MIN_W = 200, MIN_H = 110;
   const instKey = (v) => location.href + "|" + (v.currentSrc || v.src || "");  // new address or new source = new video "instance"
 
+  let buttonOn = true;   // Configuration > General > "Show the Download this video button"
+  Promise.resolve(api.runtime.sendMessage({ cmd: "cfg" })).then((c) => { if (c && c.video_button === false) { buttonOn = false; [...overlays.values()].forEach(destroy); } }).catch(() => {});
   function consider(v) {
-    if (!v || v.tagName !== "VIDEO" || overlays.has(v)) return;
+    if (!buttonOn || !v || v.tagName !== "VIDEO" || overlays.has(v)) return;
     const ov = { v, played: !v.paused, closedKey: "", fmt: undefined, fmtMsg: "", nameDirty: false, w: 150, h: 30, key: instKey(v) };
     ov.nameInput = el("input", { type: "text", spellcheck: false, title: "File name - you can edit it" });
     ov.nameInput.oninput = () => { ov.nameDirty = true; };

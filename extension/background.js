@@ -1,4 +1,4 @@
-// OpenDM browser integration (Chrome / Edge / Brave / Firefox, Manifest V3) - v1.5: audio/video stream pairing, no sniffer panel
+// OpenDM browser integration (Chrome / Edge / Brave / Firefox, Manifest V3) - v1.6 (capture rules come from OpenDM's Configuration); v1.5: audio/video stream pairing, no sniffer panel
 const api = globalThis.browser ?? globalThis.chrome;
 const DEFAULTS = { port: 6800, token: "", intercept: true, minSizeKB: 0 };
 
@@ -51,12 +51,75 @@ async function connectionStatus() {
   return { mode: "none", error: nativeError || "OpenDM's browser integration isn't registered yet" };
 }
 
+// ---------------- Which downloads does OpenDM take over? (rules live in OpenDM > Options > Configuration) ----------------
+// OpenDM hands its rules over on request (native host "config", or POST /config with the pairing token). The last answer is kept, so the rules
+// still apply while OpenDM isn't running. Until the first answer these built-in defaults apply: images and web files are never captured.
+const DEFAULT_CAP = {
+  intercept: true, capture_types: [], capture_unknown: true, exclude_sites: [], min_size_kb: 0, key_prevent: "alt", key_force: "none", browsers: {},
+  skip_types: "jpg jpeg png gif webp bmp svg ico avif heic tif tiff css js mjs map html htm json xml woff woff2 ttf otf".split(" "),
+  ctx_link: true, ctx_media: true, video_button: true,
+};
+let capCache = { t: 0, cfg: null };
+
+async function buildMenus(cap) {
+  try { await api.contextMenus.removeAll?.(); } catch {}
+  if (cap.ctx_link !== false) api.contextMenus.create({ id: "dl-link", title: "Download link with OpenDM", contexts: ["link"] });
+  if (cap.ctx_media !== false) api.contextMenus.create({ id: "dl-media", title: "Download media with OpenDM", contexts: ["video", "audio", "image"] });
+}
+
+async function getCapture(maxAge = 60e3) {
+  if (capCache.cfg && Date.now() - capCache.t < maxAge) return capCache.cfg;
+  let fresh = null;
+  try { const r = await nativeCall({ cmd: "config" }); if (r?.ok && r.config) fresh = r.config; } catch {}
+  if (!fresh) {
+    try {
+      const c = await getCfg();
+      if (c.token) {
+        const r = await fetch(`http://127.0.0.1:${c.port}/config`, { method: "POST", headers: { "Content-Type": "application/json", "X-OpenDM-Token": c.token }, body: "{}" });
+        if (r.ok) fresh = await r.json();
+      }
+    } catch {}
+  }
+  const stored = (await api.storage.local.get({ capture: null })).capture;
+  if (fresh) {
+    if (JSON.stringify(fresh) !== JSON.stringify(stored)) await api.storage.local.set({ capture: fresh });
+    if (!stored || stored.ctx_link !== fresh.ctx_link || stored.ctx_media !== fresh.ctx_media) buildMenus({ ...DEFAULT_CAP, ...fresh });
+  }
+  const cfg = { ...DEFAULT_CAP, ...(fresh || stored || {}) };
+  capCache = { t: Date.now(), cfg };
+  return cfg;
+}
+
+const extOf = (s) => { const m = /\.([a-z0-9]{1,10})$/i.exec(String(s || "").split(/[?#]/)[0]); return m ? m[1].toLowerCase() : ""; };
+const hostMatch = (host, pats) => (pats || []).some((p) => {
+  const q = p.replace(/^\*\./, "");
+  return host === q || host.endsWith("." + q) || (p.includes("*") && new RegExp("^" + p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$").test(host));
+});
+// Same rules as OpenDM's capture_decision(): excluded site -> no; skip list -> no; capture list -> yes; anything else -> "unknown types" switch.
+function captureAllowed(cap, url, filename, forced) {
+  let u; try { u = new URL(url); } catch { return false; }
+  if (!forced && hostMatch(u.hostname.toLowerCase(), cap.exclude_sites)) return false;
+  if (forced) return true;
+  const ext = extOf(filename) || extOf(u.pathname);
+  if ((cap.skip_types || []).includes(ext)) return false;
+  if ((cap.capture_types || []).includes(ext)) return true;
+  return cap.capture_unknown !== false;
+}
+async function browserName() {
+  const ua = navigator.userAgent;
+  if (/Firefox\//.test(ua)) return "firefox";
+  if (/Edg\//.test(ua)) return "edge";
+  if (/OPR\/|Opera|Vivaldi/.test(ua)) return "other";
+  try { if (navigator.brave && (await navigator.brave.isBrave())) return "brave"; } catch {}
+  return "chrome";
+}
+
 // Take over browser downloads - but ONLY ones the user is starting right now.
 // FIX (phantom downloads): the old code grabbed every download the browser reported (old/resumed items, page-script downloads,
 // downloads from a window the user isn't using). Now a download must be fresh, in the focused window, follow a real user
 // gesture (or a typed address), not be a duplicate, and not be part of a burst. Anything else is left to the browser, untouched.
 const GESTURE_MS = 20e3, FRESH_MS = 15e3, DEDUPE_MS = 60e3, BURST_N = 3, BURST_MS = 10e3;
-let lastGesture = 0;
+let lastGesture = 0, lastMods = {};
 const recentUrls = new Map();   // url -> time OpenDM was last offered it
 const burstTimes = [];
 
@@ -85,7 +148,14 @@ api.downloads.onCreated.addListener(async (item) => {
   const cfg = await getCfg();
   const url = item.finalUrl || item.url;
   if (!cfg.intercept || !/^https?:/i.test(url)) return;
-  if (cfg.minSizeKB && item.fileSize > 0 && item.fileSize < cfg.minSizeKB * 1024) return;
+  const cap = await getCapture();
+  if (!cap.intercept) return;                                             // "Capture downloads from browsers" is off in OpenDM
+  if (cap.browsers && cap.browsers[await browserName()] === false) return; // this browser is switched off in OpenDM
+  const fresh = Date.now() - lastGesture < GESTURE_MS, held = (k) => fresh && k && k !== "none" && !!lastMods[k];
+  if (held(cap.key_prevent)) return;                                      // the "let the browser do it" key was held
+  if (!captureAllowed(cap, url, item.filename, held(cap.key_force))) return;   // file type / excluded site
+  const minKB = Math.max(cfg.minSizeKB || 0, cap.min_size_kb || 0);
+  if (minKB && item.fileSize > 0 && item.fileSize < minKB * 1024) return;
   if (!(await shouldCapture(item, url))) return;                          // not the user's download: leave it to the browser
   try { await api.downloads.pause(item.id); } catch {}  // keep the browser's copy from finishing while OpenDM (maybe starting up) takes over
   try {
@@ -99,11 +169,9 @@ api.downloads.onCreated.addListener(async (item) => {
   }
 });
 
-// Right-click menus
-api.runtime.onInstalled.addListener(() => {
-  api.contextMenus.create({ id: "dl-link", title: "Download link with OpenDM", contexts: ["link"] });
-  api.contextMenus.create({ id: "dl-media", title: "Download media with OpenDM", contexts: ["video", "audio", "image"] });
-});
+// Right-click menus (which ones exist is decided in OpenDM's Configuration)
+api.runtime.onInstalled.addListener(() => buildMenus(DEFAULT_CAP));
+api.runtime.onStartup?.addListener(() => getCapture(0).catch(() => {}));
 api.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = info.linkUrl || info.srcUrl;
   if (!url) return;
@@ -352,7 +420,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab?.id;
   const reply = (p) => { p.then(sendResponse, (e) => sendResponse({ ok: false, error: e.message })); return true; };
   switch (msg?.cmd) {
-    case "gesture": lastGesture = Date.now(); return false;   // real click/key in a page (content.js)
+    case "gesture": lastGesture = Date.now(); lastMods = { alt: !!msg.alt, ctrl: !!msg.ctrl, shift: !!msg.shift }; return false;   // real click/key in a page (content.js)
+    case "cfg": return reply(getCapture(5 * 60e3));   // content.js: should the "Download this video" button show?
     case "send": return reply(sendToOpenDM(msg.job).then(() => ({ ok: true })));
     case "status": return reply(connectionStatus().then((s) => ({ ok: true, ...s })));
     case "formats":  // the overlay's menu; only for web addresses
