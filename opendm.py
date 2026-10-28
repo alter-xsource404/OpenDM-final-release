@@ -2072,7 +2072,7 @@ def parse_av(engine, code, out):
     if code == 0:  # clamscan: 0 = clean, 1 = virus found, 2 = error
         return "clean", ""
     if code == 1:
-        names = [n.strip() for n in re.findall(r"^.*?:\s*(\S.*?)\s+FOUND\s*$", out, re.M)]
+        names = [n.strip() for n in re.findall(r"^.*?:\s+(\S.*?)\s+FOUND\s*$", out, re.M)]  # ": " (not the ":" of a drive letter like C:\)
         return "infected", ", ".join(dict.fromkeys(names)) or "a threat"
     return "error", ""
 

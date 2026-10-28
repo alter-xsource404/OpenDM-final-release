@@ -14,7 +14,9 @@ class TestFindAv(unittest.TestCase):
     def _win(self, files, prefer="auto", which=None):
         env = {"ProgramData": "C:/PD", "ProgramFiles": "C:/PF", "ProgramFiles(x86)": "C:/PF86"}
         plat = [f for f in files if "Platform" in f]
-        return opendm.find_av(prefer, system="Windows", env=env, which=which or (lambda n: None), isfile=lambda p: p in files, globber=lambda pat: plat)
+        known = {os.path.normpath(f) for f in files}  # on a real Windows host os.path.join gives backslashes: compare paths, not spellings
+        found = opendm.find_av(prefer, system="Windows", env=env, which=which or (lambda n: None), isfile=lambda p: os.path.normpath(p) in known, globber=lambda pat: plat)
+        return (found[0], found[1].replace("\\", "/")) if found else None
 
     def test_defender_newest_platform_folder_wins(self):
         old, new = "C:/PD/Microsoft/Windows Defender/Platform/4.18.9-0/MpCmdRun.exe", "C:/PD/Microsoft/Windows Defender/Platform/4.18.10-0/MpCmdRun.exe"
@@ -79,6 +81,7 @@ class TestScanFile(unittest.TestCase):
         self.assertEqual((r["state"], r["engine"]), ("clean", "clamav"))
         self.assertIn("no threats", opendm.av_summary(r))
         r = self.run_with(1, f"{self.f}: Eicar-Test-Signature FOUND\n")
+        self.assertEqual(opendm.parse_av("clamav", 1, "C:\\Users\\me\\Temp\\a b.exe: Win.Test.EICAR_HDB-1 FOUND\n"), ("infected", "Win.Test.EICAR_HDB-1"))  # a drive letter has a colon too
         self.assertEqual((r["state"], r["threat"]), ("infected", "Eicar-Test-Signature"))
         self.assertTrue(opendm.av_summary(r).startswith("WARNING"))
         self.assertIn("Eicar-Test-Signature", opendm.av_summary(r))
