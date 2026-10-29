@@ -1,4 +1,4 @@
-#define AppVersion "1.6.0"
+#define AppVersion "1.7.0"
 #define AppPublisher "NovaTorrent Forge"
 #define AppURL "https://github.com/alter-xsource404/OpenDM-final-release"
 #define AppSupportURL "https://github.com/alter-xsource404/OpenDM-final-release"

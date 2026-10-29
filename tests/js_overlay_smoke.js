@@ -38,7 +38,7 @@ globalThis.chrome = {
   runtime: { sendMessage: async (m) => { sent.push(m); return m.cmd === "formats" ? formats : m.cmd === "list" ? [] : { ok: true }; }, onMessage: { addListener() {} } },
   storage: { onChanged: { addListener() {} }, local: { get: async () => ({ floating: true, overlay: true, ovCompact: false, hiddenSites: [], pos: null, ovOff: store.ovOff }), set: async (o) => Object.assign(store, o) } },
 };
-require("vm").runInThisContext(fs.readFileSync(path.join(__dirname, "..", "extension", "content.js"), "utf8"), { filename: "content.js" });
+for (const f of ["names.js", "content.js"]) require("vm").runInThisContext(fs.readFileSync(path.join(__dirname, "..", "extension", f), "utf8"), { filename: f });  // manifest order
 
 (async () => {
   await tick();

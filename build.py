@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a single-file desktop app with PyInstaller:  pip install -r requirements-build.txt && python build.py"""
+"""Build the desktop app with PyInstaller:  pip install -r requirements-build.txt && python build.py   (add --portable for a single .exe)"""
 import platform, re, shutil, subprocess, sys
 from pathlib import Path
 
@@ -36,9 +36,20 @@ def write_branding():
 write_branding()
 
 system = platform.system()
-cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--name", "OpenDM", "opendm.py"]
-cmd += ["--collect-all", "yt_dlp",          # yt-dlp loads its site extractors lazily: bundle them all (Facebook, Instagram ...)
-        "--collect-all", "imageio_ffmpeg"]  # bundle a copy of ffmpeg for merging video + audio
+# v1.7 build modes (the old build was ONE 68 MB exe that carried a second, 80 MB copy of ffmpeg - the installer shipped another one):
+#   python build.py              -> dist/OpenDM/ (a folder: no unpacking on every start, no unpacking when the browser starts the native host). The installer packs this folder.
+#   python build.py --portable   -> dist/OpenDM-windows.exe (one file; needs ffmpeg next to it, in PATH or OPENDM_FFMPEG for merging) - add --bundle-ffmpeg to embed ./ffmpeg/ffmpeg.exe
+PORTABLE = "--portable" in sys.argv
+# NOTE: do not exclude "distutils", "setuptools", "pkg_resources", "wheel" or "pip": PyInstaller's own hooks alias them and fail with "already imported as ExcludedModule".
+EXCLUDES = ["pydoc", "lib2to3", "test", "tkinter.test", "idlelib", "turtle", "turtledemo",
+            "imageio_ffmpeg",   # ffmpeg ships ONCE, as ffmpeg.exe beside the program (find_ffmpeg looks there first)
+            "PIL.ImageQt", "PIL.SpiderImagePlugin"]
+cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile" if PORTABLE else "--onedir", "--name", "OpenDM", "opendm.py"]
+cmd += ["--collect-all", "yt_dlp"]          # yt-dlp loads its site extractors lazily: bundle them all (Facebook, Instagram ...)
+for m in EXCLUDES:
+    cmd += ["--exclude-module", m]
+if "--bundle-ffmpeg" in sys.argv and PORTABLE and system == "Windows" and Path("ffmpeg/ffmpeg.exe").is_file():
+    cmd += ["--add-binary", "ffmpeg/ffmpeg.exe;."]
 if system != "Darwin":
     cmd += ["--collect-submodules", "pystray"]  # the tray backends are imported dynamically
 if system in ("Windows", "Darwin"):
@@ -51,10 +62,14 @@ elif system == "Darwin":
 subprocess.check_call(cmd)
 
 dist = Path("dist")
-if system == "Windows":
-    (dist / "OpenDM.exe").replace(dist / "OpenDM-windows.exe")
-elif system == "Darwin":
-    shutil.make_archive(str(dist / "OpenDM-macos"), "zip", dist, "OpenDM.app")
-else:
-    (dist / "OpenDM").replace(dist / "OpenDM-linux")
-print("Built:", *sorted(p.name for p in dist.iterdir()))
+if PORTABLE:
+    if system == "Windows":
+        (dist / "OpenDM.exe").replace(dist / "OpenDM-windows.exe")
+    elif system == "Darwin":
+        shutil.make_archive(str(dist / "OpenDM-macos"), "zip", dist, "OpenDM.app")
+    else:
+        (dist / "OpenDM").replace(dist / "OpenDM-linux")
+elif system == "Windows" and Path("ffmpeg/ffmpeg.exe").is_file():
+    shutil.copy2("ffmpeg/ffmpeg.exe", dist / "OpenDM" / "ffmpeg.exe")  # beside OpenDM.exe: where OpenDM looks first
+total = sum(f.stat().st_size for f in dist.rglob("*") if f.is_file())
+print(f"Built: {total / 1048576:.1f} MB in dist/ ->", *sorted(p.name for p in dist.iterdir()))

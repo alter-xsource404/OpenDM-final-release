@@ -24,7 +24,7 @@ from collections import deque
 import urllib.request, urllib.parse
 from email.message import Message
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 UA = f"Mozilla/5.0 (compatible; OpenDM/{__version__})"
 CHUNK = 64 * 1024
 MAIN_QUEUE = "Main download queue"
@@ -555,9 +555,28 @@ def size_mb_bytes(n):
     return f"{n / 1048576:.2f} MB ({n:,} Bytes)"
 
 
+_WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
+_INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")  # zero-width and bidi marks: invisible, but they end up in file names
+MAX_STEM = 120  # characters; leaves room for " (12)", the extension and the folder inside Windows' 260-character path limit
+
+
 def clean_name(s):
+    """A file name that is valid on Windows (and so everywhere): no forbidden or control characters, no reserved device names
+    (CON, NUL, COM1 ...), no trailing dots or spaces, a bounded length, and the extension kept intact."""
+    s = _INVISIBLE.sub("", str(s or ""))
     s = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in s).strip(" .")
-    return s or "download"
+    if not s:
+        return "download"
+    stem, ext = os.path.splitext(s)
+    if len(ext) > 12 or " " in ext or not stem:
+        stem, ext = s, ""
+    if len(stem) > MAX_STEM:
+        cut = stem[:MAX_STEM]
+        sp = cut.rfind(" ")
+        stem = (cut[:sp] if sp >= MAX_STEM * 0.6 else cut).rstrip(" ._-")
+    if _WIN_RESERVED.match(stem):
+        stem = "_" + stem
+    return (stem + ext) or "download"
 
 
 # ============================ speed graph helpers ============================
@@ -1886,6 +1905,15 @@ def media_site(url):
         return False
 
 
+def warm_up():
+    """Load yt-dlp and its site list in the background at start-up, so the first 'Download this video' menu doesn't wait for the import."""
+    try:
+        media_site("https://www.example.com/watch?v=0")  # imports yt-dlp and builds the extractor list
+        find_ffmpeg()
+    except Exception:
+        pass
+
+
 def detect_kind(url):
     """Which engine a link needs: 'hls' (.m3u8), 'dash' (.mpd), 'ytdlp' (video sites), or None (plain file)."""
     low = (url or "").lower()
@@ -1969,8 +1997,54 @@ def summarize_formats(info):
         mux = f.get("acodec") in (None, "none")  # picture only: the audio is fetched separately and merged
         out.append({"height": h, "fps": int(f.get("fps") or 0), "ext": "mp4" if mux else (f.get("ext") or "mp4"),
                     "size": sz + (asz if mux else 0), "approx": bool(ap or (mux and aap))})
-    return {"title": str(info.get("title") or ""), "duration": dur, "formats": out,
+    return {"title": pick_title(info), "fallback": fallback_title(info), "duration": dur, "formats": out,
             "audio": {"ext": a.get("ext") or "m4a", "size": asz, "approx": aap} if a else None}
+
+
+_TITLE_SITES = "YouTube|Facebook|Instagram|TikTok|Twitter|X|Vimeo|Dailymotion|Reddit|Twitch|Bilibili|Rumble|Streamable"
+_TITLE_TAIL = re.compile(r"\s*[-|\u2013\u2014\u00b7]\s*(?:" + _TITLE_SITES + r")\s*$", re.I)
+_GENERIC_TITLE = re.compile(r"^(?:" + _TITLE_SITES.lower() + r"|home|watch|reels?|video|videos|stories|story|untitled|log ?in.*|sign ?in.*"
+                            r"|(?:facebook|instagram|tiktok|youtube) (?:video|reel|reels|watch)|(?:video|reel|photo) by .*|.* on (?:instagram|facebook|tiktok)"
+                            r"|\(\d+\+?\) .*)$", re.I)
+
+
+def is_generic_title(t):
+    """True for titles that only name the site (Facebook, 'Video', 'Reel by X' ...): they say nothing about the media."""
+    t = re.sub(r"\s+", " ", str(t or "")).strip()
+    return len(t) < 3 or bool(_GENERIC_TITLE.match(_TITLE_TAIL.sub("", t).strip())) or bool(re.fullmatch(r"[\d\W_]+", t))
+
+
+def shorten_title(t, n=100):
+    """At most n characters, cut at a word boundary, no dangling punctuation or ellipsis."""
+    t = re.sub(r"\s+", " ", str(t or "")).strip()
+    if len(t) <= n:
+        return t.rstrip(" .\u2026")
+    cut = t[:n]
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp >= n * 0.6 else cut).rstrip(" .,;:-\u2026")
+
+
+def pick_title(info):
+    """The best real title yt-dlp knows, in this order: the site's own title, its full title, an alternative title, the first line of the
+    caption / description, the track name. Titles that only name the site are skipped. '' when nothing useful exists."""
+    first_line = next((ln.strip() for ln in str(info.get("description") or "").splitlines() if len(ln.strip()) >= 3), "")
+    ident = str(info.get("id") or "")
+    for c in (info.get("title"), info.get("fulltitle"), info.get("alt_title"), first_line, info.get("track")):
+        t = _TITLE_TAIL.sub("", re.sub(r"\s+", " ", str(c or "")).strip()).strip()
+        if t and t != ident and not is_generic_title(t):
+            return shorten_title(t)
+    return ""
+
+
+def fallback_title(info):
+    """A clean, descriptive name when the site gave no usable title: '<Site> video <id>'."""
+    site = str(info.get("extractor_key") or info.get("extractor") or "").split(":")[0]
+    if not site:
+        host = (urllib.parse.urlparse(str(info.get("webpage_url") or "")).hostname or "").lower()
+        site = host[4:] if host.startswith("www.") else host
+    site = site.split(".")[0].capitalize() if "." in site else site
+    ident = str(info.get("id") or "").strip()
+    return clean_name(" ".join(x for x in (site or "", "video", ident[:40]) if x)) if (site or ident) else "video"
 
 
 def ytdlp_formats(url, referer=None, cookie=None, ua=None):
@@ -2003,7 +2077,7 @@ def ytdlp_resolve(url, quality=0, referer=None, cookie=None, ua=None):
         raise IOError("yt-dlp found no downloadable media at this address")
     fmts = info.get("requested_formats") or [info]
     kinds = ["http" if (f.get("protocol") or "https").lower() in ("http", "https") else "hls" if (f.get("protocol") or "").lower().startswith("m3u8") else "other" for f in fmts]
-    title = clean_name(str(info.get("title") or info.get("id") or "video"))[:150]
+    title = clean_name(pick_title(info) or fallback_title(info))
     hdr = fmts[0].get("http_headers") or info.get("http_headers") or {}
     plan = {"title": title, "referer": hdr.get("Referer") or referer, "ua": hdr.get("User-Agent") or ua, "url": "", "audio": "",
             "kind": "native", "name": title + ".mp4"}
@@ -4111,6 +4185,17 @@ class Manager:
             return done > self._base
         return False
 
+    def kick(self):
+        """Start queued downloads right now instead of at the next 500 ms tick (used when the user clicks Start Download)."""
+        allowed = self.in_window()
+        active = sum(d.status in ACTIVE for d in self.items)
+        for d in self.items:
+            if active >= self.max_active:
+                break
+            if d.status == "Queued" and (allowed or d.force):
+                d.start()
+                active += 1
+
     def remove(self, d, delete_file=False, delete_completed=False):
         d.pause()
         if d.thread:
@@ -4693,8 +4778,13 @@ class NativeHost:
             job = msg.get("job")
             if not isinstance(job, dict) or not str(job.get("url", "")).lower().startswith(("http://", "https://")):
                 raise HostError("That isn't a web address OpenDM can read.")
-            self.ensure_running()
-            code, obj = self._json_call("/formats", {k: job[k] for k in ("url", "referer", "cookie", "userAgent") if job.get(k) not in (None, "")})
+            body = {k: job[k] for k in ("url", "referer", "cookie", "userAgent") if job.get(k) not in (None, "")}
+            code, obj = self._json_call("/formats", body)  # try first: no extra ping when OpenDM is already running
+            if code == 0:
+                if job.get("prefetch"):  # a background look-ahead never starts OpenDM
+                    return {"ok": False, "error": "OpenDM isn't running", "prefetch": True}
+                self.ensure_running()
+                code, obj = self._json_call("/formats", body)
             if code == 200 and isinstance(obj, dict):
                 return obj
             raise HostError({401: "OpenDM refused the request (pairing token mismatch). Restart OpenDM and try again.", 0: "Could not reach OpenDM."}.get(code, f"OpenDM answered with error {code}."))
@@ -4702,8 +4792,11 @@ class NativeHost:
             job = msg.get("job")
             if not isinstance(job, dict) or not str(job.get("url", "")).lower().startswith(("http://", "https://")):
                 raise HostError("That isn't a web address OpenDM can download.")
-            self.ensure_running()
-            code = self._call("POST", "/add", {k: job[k] for k in HOST_JOB_KEYS if job.get(k) not in (None, "")})
+            payload = {k: job[k] for k in HOST_JOB_KEYS if job.get(k) not in (None, "")}
+            code = self._call("POST", "/add", payload)  # try first: the usual case (OpenDM is running) costs one request, not two
+            if code == 0:
+                self.ensure_running()  # only now start OpenDM
+                code = self._call("POST", "/add", payload)
             if code == 200:
                 return {"ok": True}
             raise HostError({401: "OpenDM refused the request (pairing token mismatch). Restart OpenDM and try again.",
@@ -4728,29 +4821,52 @@ class NativeHost:
             return 2
         if stdin is None or stdout is None:
             stdin, stdout = _std_binary_streams()
-        while True:
+        # The extension keeps ONE connection (and so one host process) open. Messages carry an "id" that the reply echoes, and
+        # the slow "formats" lookup (yt-dlp, seconds) runs on its own thread so a download hand-over is never queued behind it.
+        wlock, workers, closed = threading.Lock(), [], threading.Event()
+
+        def respond(m):
             try:
-                msg = nm_read(stdin)
-            except (ValueError, struct.error, OSError) as e:
-                self.log(f"bad message: {e}")
-                try:
-                    nm_write(stdout, {"ok": False, "error": f"Bad message: {e}"})
-                except OSError:
-                    pass
-                return 1
-            if msg is None:
-                return 0
-            try:
-                reply = self.handle(msg)
+                reply = self.handle(m)
             except HostError as e:
                 reply = {"ok": False, "error": str(e)}
             except Exception as e:
                 self.log(f"unexpected: {e!r}")
                 reply = {"ok": False, "error": f"Host error: {e}"}
+            if isinstance(m, dict) and "id" in m and isinstance(reply, dict):
+                reply = dict(reply, id=m["id"])
+            with wlock:
+                try:
+                    nm_write(stdout, reply)
+                except OSError:  # the browser closed the pipe
+                    closed.set()
+
+        def finish(code):
+            for t in workers:
+                t.join(timeout=100)
+            return code
+
+        while not closed.is_set():
             try:
-                nm_write(stdout, reply)
-            except OSError:  # the browser closed the pipe
-                return 0
+                msg = nm_read(stdin)
+            except (ValueError, struct.error, OSError) as e:
+                self.log(f"bad message: {e}")
+                with wlock:
+                    try:
+                        nm_write(stdout, {"ok": False, "error": f"Bad message: {e}"})
+                    except OSError:
+                        pass
+                return finish(1)
+            if msg is None:
+                break
+            if isinstance(msg, dict) and msg.get("cmd") == "formats":
+                t = threading.Thread(target=respond, args=(msg,), daemon=True)
+                t.start()
+                workers.append(t)
+                workers[:] = [w for w in workers if w.is_alive()]
+            else:
+                respond(msg)
+        return finish(0)
 
 
 # ============================== system tray ==============================
@@ -6152,6 +6268,11 @@ class App:
         else:
             self.mgr.add(job["url"], job["folder"], job["connections"], kind=job["kind"], **job["kw"])
 
+    def _capture_pump(self):
+        """Look for a captured link every 100 ms (the main tick only runs every 500 ms), so the dialog shows up almost at once."""
+        self._guard(self.drain_captured)
+        self.root.after(100, self._capture_pump)
+
     def drain_captured(self):
         # One confirmation window at a time; the rest wait in the queue (and expire if the user never gets to them).
         while not self.pending_urls:
@@ -6251,6 +6372,8 @@ class App:
                 except ValueError as e:
                     messagebox.showerror("OpenDM", str(e), parent=win)
             close()
+            if not later:
+                self.mgr.kick()  # begin transferring now, not at the next 500 ms tick
             self.after_change()
             if not later:
                 self.progress_window(d)
@@ -8216,6 +8339,8 @@ Ctrl+C        Copy the address of the selected downloads""", width=60, height=12
         if self.mgr.settings.get("widget_on"):
             self.widget.show()
         self.tick()
+        self._capture_pump()
+        threading.Thread(target=warm_up, daemon=True).start()
         if self.mgr.settings.get("check_updates", True) and not os.environ.get("OPENDM_NO_UPDATE_CHECK"):
             self.root.after(4000, self.start_update_check)  # a few seconds after start-up, in the background; silent when there is nothing new or no internet
         if self.minimized or self.mgr.settings.get("start_minimized"):

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenDM Integration",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Send downloads from your browser to OpenDM, the open-source download manager.",
   "permissions": [
     "downloads",
@@ -43,9 +43,10 @@
         "<all_urls>"
       ],
       "js": [
+        "names.js",
         "content.js"
       ],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": true
     }
   ],

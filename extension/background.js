@@ -1,4 +1,4 @@
-// OpenDM browser integration (Chrome / Edge / Brave / Firefox, Manifest V3) - v1.6 (capture rules come from OpenDM's Configuration); v1.5: audio/video stream pairing, no sniffer panel
+// OpenDM browser integration (Chrome / Edge / Brave / Firefox, Manifest V3) - v1.7 (one persistent native-messaging connection instead of a new host process per message); v1.6: capture rules come from OpenDM's Configuration; v1.5: audio/video stream pairing, no sniffer panel
 const api = globalThis.browser ?? globalThis.chrome;
 const DEFAULTS = { port: 6800, token: "", intercept: true, minSizeKB: 0 };
 
@@ -17,7 +17,37 @@ async function cookieHeader(url) {
 // Fallback: the local server on 127.0.0.1 with a pairing token pasted into the options page.
 const NATIVE_HOST = "org.opendm.nativehost";
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timed out")), ms))]);
-const nativeCall = (msg) => withTimeout(Promise.resolve(api.runtime.sendNativeMessage(NATIVE_HOST, msg)), 30000);  // 30 s: OpenDM may need time to start
+// v1.7: sendNativeMessage starts a NEW host process for every message (for a packaged OpenDM that means unpacking and starting the whole
+// program each time: seconds). connectNative keeps one host process alive; messages carry an id, the host echoes it, so calls can overlap
+// (a slow "formats" lookup never blocks a download hand-over). Falls back to sendNativeMessage where connectNative doesn't exist.
+let nPort = null, nSeq = 0;
+const nPending = new Map();
+function nativePort() {
+  if (nPort) return nPort;
+  const p = api.runtime.connectNative(NATIVE_HOST);
+  p.onMessage.addListener((m) => {
+    const w = m && nPending.get(m.id);
+    if (!w) return;
+    nPending.delete(m.id); clearTimeout(w.t);
+    const { id, ...reply } = m; w.res(reply);
+  });
+  p.onDisconnect.addListener(() => {
+    const err = new Error((api.runtime.lastError && api.runtime.lastError.message) || "Native host has exited.");
+    if (nPort === p) nPort = null;
+    for (const [id, w] of nPending) { clearTimeout(w.t); w.rej(err); nPending.delete(id); }
+  });
+  return (nPort = p);
+}
+function viaPort(msg, ms) {
+  return new Promise((res, rej) => {
+    const id = ++nSeq, t = setTimeout(() => { nPending.delete(id); rej(new Error("timed out")); }, ms);
+    nPending.set(id, { res, rej, t });
+    const post = () => nativePort().postMessage({ ...msg, id });
+    try { post(); } catch { nPort = null; try { post(); } catch (e) { nPending.delete(id); clearTimeout(t); rej(e); } }   // a stale port: reconnect once
+  });
+}
+const nativeCall = (msg, ms = 30000) =>   // 30 s: OpenDM may need time to start
+  typeof api.runtime.connectNative === "function" ? viaPort(msg, ms) : withTimeout(Promise.resolve(api.runtime.sendNativeMessage(NATIVE_HOST, msg)), ms);
 
 async function sendToOpenDM(job) {
   const full = { ...job, ts: Date.now(), cookie: await cookieHeader(job.url), userAgent: navigator.userAgent };
@@ -171,7 +201,8 @@ api.downloads.onCreated.addListener(async (item) => {
 
 // Right-click menus (which ones exist is decided in OpenDM's Configuration)
 api.runtime.onInstalled.addListener(() => buildMenus(DEFAULT_CAP));
-api.runtime.onStartup?.addListener(() => getCapture(0).catch(() => {}));
+api.runtime.onStartup?.addListener(() => getCapture(0).catch(() => {}));   // also opens the native connection ahead of the first capture
+getCapture(0).catch(() => {});   // service worker (re)started: warm the host process and the capture rules now, not at the first download
 api.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = info.linkUrl || info.srcUrl;
   if (!url) return;
@@ -227,8 +258,18 @@ function normalizeUrl(u) {
   } catch { return u; }
 }
 
+const seenMedia = new Map();   // tabId -> Set of normalized URLs already listed: duplicates are dropped before any storage or tab lookup
+function firstSight(tabId, url) {
+  let set = seenMedia.get(tabId);
+  if (!set) seenMedia.set(tabId, (set = new Set()));
+  if (set.has(url)) return false;
+  if (set.size > 200) set.clear();
+  set.add(url);
+  return true;
+}
 async function addMediaNow(tabId, item) {
   const norm = normalizeUrl(item.url);
+  if (!firstSight(tabId, norm)) return;
   if (norm !== item.url) item = { ...item, url: norm, orig: item.url, size: 0 };
   const key = "media:" + tabId;
   const cur = (await sess.get(key))[key] ?? [];
@@ -263,9 +304,9 @@ api.webRequest.onHeadersReceived.addListener(
 );
 
 api.tabs.onUpdated.addListener((id, ci) => {
-  if (ci.status === "loading" && ci.url) { sess.remove("media:" + id); api.action.setBadgeText({ tabId: id, text: "" }); notifyPanel(id); }
+  if (ci.status === "loading" && ci.url) { seenMedia.delete(id); sess.remove("media:" + id); api.action.setBadgeText({ tabId: id, text: "" }); notifyPanel(id); }
 });
-api.tabs.onRemoved.addListener((id) => sess.remove("media:" + id));
+api.tabs.onRemoved.addListener((id) => { seenMedia.delete(id); sess.remove("media:" + id); });
 
 // ---------------- Quality of direct files: read the MP4 header, not the whole file ----------------
 const u32 = (b, o) => (((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0);
@@ -395,22 +436,24 @@ async function getVariants(url) {
 // ---------------- Stream list from OpenDM (yt-dlp): YouTube, Facebook, Instagram ... ----------------
 // OpenDM reads the page's qualities and sizes; the answer is cached for a few minutes. Nothing downloads until the user picks a row.
 const fcache = new Map();
-async function getFormats(url, referer) {
+async function getFormats(url, referer, prefetch) {
   const hit = fcache.get(url);
   if (hit && Date.now() - hit.t < 5 * 60e3) return hit.data;
-  const job = { url, referer: referer || "", cookie: await cookieHeader(url), userAgent: navigator.userAgent };
+  const job = { url, referer: referer || "", cookie: await cookieHeader(url), userAgent: navigator.userAgent, ...(prefetch ? { prefetch: true } : {}) };
   let data = null, nativeError = "";
-  try { data = await withTimeout(Promise.resolve(api.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "formats", job })), 90000); }  // yt-dlp can take a while
+  try { data = await nativeCall({ cmd: "formats", job }, 90000); }  // yt-dlp can take a while
   catch (e) { nativeError = e?.message || String(e); }
   if (!data) {
     const cfg = await getCfg();
     if (!cfg.token) throw new Error("not paired: OpenDM's browser integration isn't registered yet" + (nativeError ? ` (${nativeError})` : ""));
+    if (prefetch) return { ok: false, error: "prefetch skipped", prefetch: true };
     const r = await fetch(`http://127.0.0.1:${cfg.port}/formats`, {
       method: "POST", headers: { "Content-Type": "application/json", "X-OpenDM-Token": cfg.token }, body: JSON.stringify(job),
     });
     if (!r.ok) throw new Error("OpenDM replied " + r.status);
     data = await r.json();
   }
+  if (data?.prefetch) return data;   // OpenDM isn't running: nothing to cache
   if (data?.ok && data.formats?.length) fcache.set(url, { t: Date.now(), data });
   if (fcache.size > 40) fcache.delete(fcache.keys().next().value);
   return data;
@@ -425,7 +468,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "send": return reply(sendToOpenDM(msg.job).then(() => ({ ok: true })));
     case "status": return reply(connectionStatus().then((s) => ({ ok: true, ...s })));
     case "formats":  // the overlay's menu; only for web addresses
-      return /^https?:/i.test(msg.url || "") ? reply(getFormats(msg.url, msg.referer)) : false;
+      return /^https?:/i.test(msg.url || "") ? reply(getFormats(msg.url, msg.referer, !!msg.prefetch)) : false;
     case "list": return tabId == null ? false : reply(listMedia(tabId));
     case "variants":  // only for streams this tab actually loaded
       return tabId == null ? false : reply(listMedia(tabId).then((l) => (l.some((m) => m.url === msg.url) ? getVariants(msg.url) : [])));

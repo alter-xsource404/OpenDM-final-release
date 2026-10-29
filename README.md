@@ -171,7 +171,7 @@ Downloads you click are handed to OpenDM (if OpenDM isn't running, the browser k
 - Video+audio merging needs ffmpeg, and pairing relies on both tracks having been loaded by the page (play the video for a few seconds first).
 - **DASH** (`.mpd`) is handled by ffmpeg, so it needs an ffmpeg build that can read DASH. The ffmpeg bundled with the Windows installer can; some minimal builds can't, and OpenDM then shows an error instead of a file. DRM-protected DASH is refused.
 - **Video sites** (YouTube etc.) rely on yt-dlp, which the release builds include. Sites change often, so if one stops working, update it with `pip install -U yt-dlp` when running from source.
-- Automatic browser setup was built and tested with the Windows registry API replaced by a faithful stand-in, and for real on Linux (files, launcher, protocol); it hasn't been run against real Chrome or Edge on Windows yet, so please use the checks above and report anything odd. Each download sent through the host starts a short-lived process (about a second with the one-file `.exe`).
+- Automatic browser setup was built and tested with the Windows registry API replaced by a faithful stand-in, and for real on Linux (files, launcher, protocol); it hasn't been run against real Chrome or Edge on Windows yet, so please use the checks above and report anything odd. Since v1.7 the extension keeps one native-host process open instead of starting a new one per download; the 1.7 speed-ups were verified with automated tests and mocks, not yet measured in real Chrome/Edge/Brave on Windows.
 - The scheduler works only while OpenDM is running.
 - The tray icon isn't available on macOS, and on GNOME it needs the AppIndicator extension.
 - Please respect copyright and each website's terms of service. You are responsible for what you download.
@@ -183,7 +183,8 @@ python -m unittest discover -s tests -v      # core app: local servers, no inter
 xvfb-run -a python tests/gui_smoke.py          # drives the real window (needs a display; skips without one)
 (cd tests/js && npm install && npm test)      # extension: background logic, stream pairing, native host
 pip install pillow && python tools/make_icons.py   # regenerate all icons from code (assets/, extension/icons/, window + panel icons)
-pip install -r requirements-build.txt && python build.py   # standalone app for your OS (dist/)
+pip install -r requirements-build.txt && python build.py             # program folder dist/OpenDM/ (what the installer packs; ffmpeg.exe from ./ffmpeg is copied in)
+python build.py --portable                                          # single-file exe (ffmpeg must sit next to it, or add --bundle-ffmpeg)
 ```
 
 CI runs the tests on Windows, macOS and Linux. Pushing a tag like `v1.2.0` builds all three apps and attaches them, plus the extension zip, to a GitHub Release.

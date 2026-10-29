@@ -1,4 +1,4 @@
-// OpenDM content script - v1.6
+// OpenDM content script - v1.7 (file names: names.js + page caption; formats prefetched when a video starts playing)
 // ONLY the IDM-style "Download this video" button on playing <video> elements (drag it, double-click resets, x hides it for that video).
 // FIX (#2): the "OpenDM Video Sniffer" floating panel/bubble was removed completely.
 // FIX (no sound): the menu now lists yt-dlp's formats (video+audio merged by OpenDM/ffmpeg) whenever the page is supported;
@@ -70,7 +70,8 @@
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const fmtSize = (n) => (n >= 1073741824 ? (n / 1073741824).toFixed(2) + " GB" : n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.ceil(n / 1024) + " KB");
   const fmtEta = (s) => (s < 5 ? "a few seconds" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : Math.floor(s / 3600) + " h " + Math.round((s % 3600) / 60) + " min");
-  const safeName = (s) => String(s || "").replace(/[\/\\:]+/g, "-").replace(/[?*"<>|\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim();
+  const N = globalThis.OpenDMNames;
+  const safeName = N.safeName;
   const fileExt = (u) => { try { const m = new URL(u).pathname.match(/\.([a-z0-9]{2,4})$/i); return m ? m[1].toLowerCase() : "mp4"; } catch { return "mp4"; } };
   const extOf = (u) => { try { return (new URL(u).pathname.match(/\.([a-z0-9]{2,4})$/i)?.[1] || "FILE").toUpperCase(); } catch { return "FILE"; } };
   const connected = (e = "") => /not paired|replied|token|fetch|network|refused|reach|isn't running|timed out/i.test(e) || !e;
@@ -79,24 +80,48 @@
     : /replied 401|token/i.test(e) ? "OpenDM and the extension disagree about the pairing token. Restart OpenDM, or re-paste the token in the extension's options."
     : /fetch|network|refused/i.test(e) || !e ? "OpenDM isn't running (or the port is wrong). Start it and try again." : e;
 
-  // Best guess at the video's caption: the <video>'s own label, then the page's social/meta title, then <h1>/<title>.
-  const SITE_TAIL = /\s*[-|\u2013\u2014\u00b7]\s*(YouTube|Facebook|Instagram|TikTok|Twitter|X|Vimeo|Dailymotion|Reddit|Twitch|Bilibili)\s*$/i;
-  const GENERIC = /^(facebook|instagram|youtube|tiktok|twitter|x|vimeo|home|watch|reels?|video|videos|log ?in.*|untitled)$/i;
-  function cleanTitle(t) {
-    t = String(t || "").replace(/\s+/g, " ").trim().replace(/^\(\d+\+?\)\s*/, "");
-    const ig = t.match(/^.{1,80}? on Instagram:\s*["\u201c](.+?)["\u201d]?\s*$/s);
-    return (ig ? ig[1] : t).replace(SITE_TAIL, "").trim();
+  // ---- the video's name (v1.7). Order: yt-dlp's real title -> the post's caption in the page -> metadata -> "<Site> video <id>".
+  // The tab title is only used when it isn't generic; "Facebook", "Reels", "(3) Facebook" and the like are rejected by names.js.
+  const BOILER = /^(follow|following|like|comment|share|reply|see more|more|sponsored|public|reels?|suggested for you|add friend|join|send message|watch more|see translation|original audio)$/i;
+  const meta = (sel) => document.querySelector(sel)?.content;
+  function jsonLdTexts() {
+    const out = [];
+    for (const n of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const walk = (o) => { if (!o || typeof o !== "object") return; if (Array.isArray(o)) return o.forEach(walk);
+          if (/VideoObject|AudioObject|SocialMediaPosting/i.test([].concat(o["@type"] || []).join(" "))) out.push(o.name, o.headline, o.caption, o.description);
+          walk(o["@graph"]); };
+        walk(JSON.parse(n.textContent));
+      } catch {}
+      if (out.length > 12) break;
+    }
+    return out;
   }
-  function captionGuess(video) {
-    const meta = (s) => document.querySelector(s)?.content;
-    const vids = [...document.querySelectorAll("video")];
-    const v = video || vids.find((x) => !x.paused && !x.ended) || vids[0];
-    const cands = [v?.getAttribute("aria-label"), v?.title, v?.closest("figure")?.querySelector("figcaption")?.textContent,
-      meta("meta[property='og:title']"), meta("meta[name='twitter:title']"), document.querySelector("h1")?.textContent,
-      document.title, meta("meta[property='og:description']")];
-    for (const x of cands) { const t = safeName(cleanTitle(x)); if (t.length >= 3 && !GENERIC.test(t)) return t; }
-    return safeName(location.hostname) || "video";
+  // The caption of the post this <video> sits in: nearest enclosing post, first real text block that isn't a button, a link (author name) or UI chrome.
+  function postCaption(video) {
+    const bad = (e) => e.closest('a[role="link"],a[href],button,[role="button"],[role="navigation"],nav,header,[role="tablist"],[aria-hidden="true"],[contenteditable="true"],form');
+    for (let n = video?.parentElement, i = 0; n && i < 16; n = n.parentElement, i++) {
+      if (n.querySelectorAll("video").length > 1) break;   // we climbed into a feed: a caption here would belong to another video
+      const exact = n.querySelector('[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-testid="post_message"],[itemprop="description"],figcaption');
+      if (exact && (exact.innerText || "").trim().length >= 3) return exact.innerText;
+      for (const e of n.querySelectorAll('div[dir="auto"],span[dir="auto"],h1,h2')) {
+        if (bad(e)) continue;
+        const t = (e.innerText || "").replace(/\s+/g, " ").trim();
+        if (t.length >= 8 && t.length <= 600 && !BOILER.test(t) && !/^[\d.,\sKMB]+$/.test(t)) return t;
+      }
+    }
+    return "";
   }
+  function pickFor(video, yt) {
+    const v = video || [...document.querySelectorAll("video")].find((x) => !x.paused && !x.ended) || document.querySelector("video");
+    return N.pickName({
+      ytTitle: yt?.title, ytFallback: yt?.fallback,
+      dom: [v?.getAttribute("aria-label"), v?.title, postCaption(v), ...jsonLdTexts()],
+      meta: [meta("meta[property='og:title']"), meta("meta[property='og:description']"), meta("meta[name='twitter:title']"), meta("meta[name='description']"), document.querySelector("h1")?.textContent, document.title],
+      pageUrl: location.href,
+    });
+  }
+  const captionGuess = (video) => pickFor(video, null);
 
   // The address yt-dlp should read: this page when it is a video page, else the permalink of the post the <video> sits in (feeds, reels).
   const VIDEO_PAGE = /(\/watch\?|\/watch\/\?|\/shorts\/|\/reels?\/[\w-]+|\/p\/[\w-]+|\/tv\/|\/videos?\/|\/status\/|\/clip\/|\/embed\/|youtu\.be\/|\/v\/)/i;
@@ -306,7 +331,7 @@
   async function openMenu(ov) {
     overlays.forEach((o) => o !== ov && closeMenu(o));
     ov.el.classList.add("open");
-    if (!ov.nameDirty) ov.nameInput.value = ov.fmt?.title ? safeName(ov.fmt.title) : captionGuess(ov.v);
+    if (!ov.nameDirty) ov.nameInput.value = pickFor(ov.v, ov.fmt || null);
     ov.foot.className = "mf"; ov.foot.textContent = "Pick a quality to send it to OpenDM.";
     renderList(ov); layout(ov);
     const src = ov.v.currentSrc || ov.v.src || "";
@@ -318,7 +343,7 @@
       ov.fmt = r && r.ok ? r : false;
       ov.fmtMsg = r && !r.ok ? (r.error || "") : (r === undefined ? "no answer" : "");
       ov.speed = r?.speed || 0;
-      if (ov.fmt && ov.fmt.title && !ov.nameDirty) ov.nameInput.value = safeName(ov.fmt.title);
+      if (ov.fmt && !ov.nameDirty) ov.nameInput.value = pickFor(ov.v, ov.fmt);
       if (ov.fmtMsg && !r?.missing && connected(ov.fmtMsg) && !/not a video page/i.test(ov.fmtMsg)) { ov.foot.className = "mf err"; ov.foot.textContent = errorHint(ov.fmtMsg); }
       renderList(ov);
     }
@@ -405,7 +430,16 @@
   }
 
   // ---------- finding videos: now, and as the page changes ----------
-  const markPlayed = (v) => { consider(v); const ov = overlays.get(v); if (ov) { ov.played = true; wake(); } };
+  // Look-ahead: when a video starts playing on a site yt-dlp supports, ask OpenDM for its qualities right away (only if OpenDM is already
+  // running - this never starts it), so the menu is filled the moment the user opens it.
+  const PREFETCH_HOSTS = /(^|\.)(youtube\.com|youtu\.be|facebook\.com|fb\.watch|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|dailymotion\.com|twitch\.tv|reddit\.com|bilibili\.com|rumble\.com)$/i;
+  async function prefetch(ov) {
+    if (ov.fmt !== undefined || ov.pre === location.href || !PREFETCH_HOSTS.test(location.hostname)) return;
+    ov.pre = location.href;
+    const r = await send({ cmd: "formats", url: pageUrlFor(ov.v), referer: location.href, prefetch: true });
+    if (r && r.ok && ov.fmt === undefined) { ov.fmt = r; ov.speed = r.speed || 0; if (!ov.nameDirty) ov.nameInput.value = pickFor(ov.v, r); renderList(ov); }
+  }
+  const markPlayed = (v) => { consider(v); const ov = overlays.get(v); if (ov) { ov.played = true; wake(); setTimeout(() => prefetch(ov), 400); } };
   window.addEventListener("playing", (e) => e.target?.tagName === "VIDEO" && markPlayed(e.target), true);
   window.addEventListener("play", (e) => e.target?.tagName === "VIDEO" && markPlayed(e.target), true);
   window.addEventListener("loadstart", (e) => { if (e.target?.tagName === "VIDEO") { consider(e.target); wake(); } }, true);  // reels / playlists swap the source

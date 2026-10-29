@@ -1265,7 +1265,7 @@ class TestIdmWindows(Base):
             buttons = {c.kwargs.get("text"): c.kwargs.get("command") for c in opendm.ttk.Button.call_args_list}
             buttons["Start Download"]()
         self.assertEqual(len(app.mgr.items), 1)
-        self.assertEqual(app.mgr.items[0].status, "Queued")
+        self.assertNotEqual(app.mgr.items[0].status, "Queued")  # v1.7: Start Download begins at once (mgr.kick), not at the next tick
         pw.assert_called_once_with(app.mgr.items[0])
         self.assertNotIn(job["url"], app.pending_urls)
 
@@ -1551,13 +1551,13 @@ class TestUniversal(Base):
         if not (HLS.get("/mux/video.mp4") and opendm.find_ffmpeg()):
             self.skipTest("needs ffmpeg that can encode test media")
         url = "https://www.facebook.com/watch/?v=1"
-        info = {"title": "Reel", "requested_formats": [
+        info = {"title": "My Reel Clip", "requested_formats": [
             {"url": A("/mux/video.mp4"), "protocol": "https", "ext": "mp4", "vcodec": "avc1", "acodec": "none"},
             {"url": A("/mux/audio.m4a"), "protocol": "https", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"}]}
         with fake_ytdlp({url: info}):
             d = run(opendm.ExtractDownload(url, self.tmp, 2), timeout=90)
         self.assertEqual(d.status, "Completed", d.error)
-        self.assertEqual(sorted(os.listdir(self.tmp)), ["Reel.mp4"])
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["My Reel Clip.mp4"])
         if probe_streams(d.path) is not None:
             self.assertEqual(probe_streams(d.path), ["audio", "video"])
 
@@ -1745,7 +1745,9 @@ class TestVideoMenu(Base):
         with fake_ytdlp({url: self.INFO}):
             host.serve(["chrome-extension://" + opendm.DEFAULT_EXTENSION_IDS[0] + "/"],
                        io.BytesIO(b"".join(_frame(m) for m in ({"cmd": "formats", "job": {"url": url, "cookie": "a=b"}}, {"cmd": "formats", "job": {"url": "ftp://x"}}))), out)
-        ok, bad = _unframe(out.getvalue())
+        replies = _unframe(out.getvalue())  # v1.7: slow lookups run on their own thread, so replies may come back in any order
+        ok = next(x for x in replies if x.get("formats"))
+        bad = next(x for x in replies if not x.get("formats"))
         self.assertEqual((ok["ok"], [f["height"] for f in ok["formats"]]), (True, [1080, 720, 480]))
         self.assertEqual(bad["ok"], False)
         self.assertIn("web address", bad["error"])
